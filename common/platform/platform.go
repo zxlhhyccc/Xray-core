@@ -8,21 +8,23 @@ import (
 )
 
 const (
-	PluginLocation  = "xray.location.plugin"
 	ConfigLocation  = "xray.location.config"
 	ConfdirLocation = "xray.location.confdir"
-	ToolLocation    = "xray.location.tool"
 	AssetLocation   = "xray.location.asset"
+	CertLocation    = "xray.location.cert"
 
 	UseReadV         = "xray.buf.readv"
 	UseFreedomSplice = "xray.buf.splice"
 	UseVmessPadding  = "xray.vmess.padding"
 	UseCone          = "xray.cone.disabled"
+	UseStrictJSON    = "xray.json.strict"
 
 	BufferSize           = "xray.ray.buffer.size"
 	BrowserDialerAddress = "xray.browser.dialer"
 	XUDPLog              = "xray.xudp.show"
 	XUDPBaseKey          = "xray.xudp.basekey"
+
+	TunFdKey = "xray.tun.fd"
 )
 
 type EnvFlag struct {
@@ -70,7 +72,7 @@ func NormalizeEnvName(name string) string {
 	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(name)), ".", "_")
 }
 
-func getExecutableDir() string {
+func GetExecutableDir() string {
 	exec, err := os.Executable()
 	if err != nil {
 		return ""
@@ -78,19 +80,8 @@ func getExecutableDir() string {
 	return filepath.Dir(exec)
 }
 
-func getExecutableSubDir(dir string) func() string {
-	return func() string {
-		return filepath.Join(getExecutableDir(), dir)
-	}
-}
-
-func GetPluginDirectory() string {
-	pluginDir := NewEnvFlag(PluginLocation).GetValue(getExecutableSubDir("plugins"))
-	return pluginDir
-}
-
 func GetConfigurationPath() string {
-	configPath := NewEnvFlag(ConfigLocation).GetValue(getExecutableDir)
+	configPath := NewEnvFlag(ConfigLocation).GetValue(GetExecutableDir)
 	return filepath.Join(configPath, "config.json")
 }
 

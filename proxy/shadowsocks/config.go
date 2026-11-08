@@ -2,16 +2,17 @@ package shadowsocks
 
 import (
 	"bytes"
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/sha1"
 	"io"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/antireplay"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
@@ -19,13 +20,13 @@ import (
 
 // MemoryAccount is an account type converted from Account.
 type MemoryAccount struct {
-	Cipher Cipher
-	Key    []byte
-
-	replayFilter antireplay.GeneralizedReplayFilter
+	Cipher     Cipher
+	CipherType CipherType
+	Key        []byte
+	Password   string
 }
 
-var ErrIVNotUnique = newError("IV is not unique")
+var ErrIVNotUnique = errors.New("IV is not unique")
 
 // Equals implements protocol.Account.Equals().
 func (a *MemoryAccount) Equals(another protocol.Account) bool {
@@ -35,22 +36,15 @@ func (a *MemoryAccount) Equals(another protocol.Account) bool {
 	return false
 }
 
-func (a *MemoryAccount) CheckIV(iv []byte) error {
-	if a.replayFilter == nil {
-		return nil
+func (a *MemoryAccount) ToProto() proto.Message {
+	return &Account{
+		CipherType: a.CipherType,
+		Password:   a.Password,
 	}
-	if a.replayFilter.Check(iv) {
-		return nil
-	}
-	return ErrIVNotUnique
 }
 
 func createAesGcm(key []byte) cipher.AEAD {
-	block, err := aes.NewCipher(key)
-	common.Must(err)
-	gcm, err := cipher.NewGCM(block)
-	common.Must(err)
-	return gcm
+	return crypto.NewAesGcm(key)
 }
 
 func createChaCha20Poly1305(key []byte) cipher.AEAD {
@@ -91,10 +85,8 @@ func (a *Account) getCipher() (Cipher, error) {
 			IVBytes:         32,
 			AEADAuthCreator: createXChaCha20Poly1305,
 		}, nil
-	case CipherType_NONE:
-		return NoneCipher{}, nil
 	default:
-		return nil, newError("Unsupported cipher.")
+		return nil, errors.New("Unsupported cipher.")
 	}
 }
 
@@ -102,17 +94,13 @@ func (a *Account) getCipher() (Cipher, error) {
 func (a *Account) AsAccount() (protocol.Account, error) {
 	Cipher, err := a.getCipher()
 	if err != nil {
-		return nil, newError("failed to get cipher").Base(err)
+		return nil, errors.New("failed to get cipher").Base(err)
 	}
 	return &MemoryAccount{
-		Cipher: Cipher,
-		Key:    passwordToCipherKey([]byte(a.Password), Cipher.KeySize()),
-		replayFilter: func() antireplay.GeneralizedReplayFilter {
-			if a.IvCheck {
-				return antireplay.NewBloomRing()
-			}
-			return nil
-		}(),
+		Cipher:     Cipher,
+		CipherType: a.CipherType,
+		Key:        passwordToCipherKey([]byte(a.Password), Cipher.KeySize()),
+		Password:   a.Password,
 	}, nil
 }
 
@@ -182,7 +170,7 @@ func (c *AEADCipher) EncodePacket(key []byte, b *buf.Buffer) error {
 
 func (c *AEADCipher) DecodePacket(key []byte, b *buf.Buffer) error {
 	if b.Len() <= c.IVSize() {
-		return newError("insufficient data: ", b.Len())
+		return errors.New("insufficient data: ", b.Len())
 	}
 	ivLen := c.IVSize()
 	payloadLen := b.Len()
@@ -193,30 +181,6 @@ func (c *AEADCipher) DecodePacket(key []byte, b *buf.Buffer) error {
 		return err
 	}
 	b.Resize(ivLen, int32(len(bbb)))
-	return nil
-}
-
-type NoneCipher struct{}
-
-func (NoneCipher) KeySize() int32 { return 0 }
-func (NoneCipher) IVSize() int32  { return 0 }
-func (NoneCipher) IsAEAD() bool {
-	return false
-}
-
-func (NoneCipher) NewDecryptionReader(key []byte, iv []byte, reader io.Reader) (buf.Reader, error) {
-	return buf.NewReader(reader), nil
-}
-
-func (NoneCipher) NewEncryptionWriter(key []byte, iv []byte, writer io.Writer) (buf.Writer, error) {
-	return buf.NewWriter(writer), nil
-}
-
-func (NoneCipher) EncodePacket(key []byte, b *buf.Buffer) error {
-	return nil
-}
-
-func (NoneCipher) DecodePacket(key []byte, b *buf.Buffer) error {
 	return nil
 }
 

@@ -1,16 +1,17 @@
 package commander
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/signal/done"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/transport/internet"
 	"google.golang.org/grpc"
 )
 
@@ -21,12 +22,14 @@ type Commander struct {
 	services []Service
 	ohm      outbound.Manager
 	tag      string
+	listen   string
 }
 
 // NewCommander creates a new Commander based on the given config.
 func NewCommander(ctx context.Context, config *Config) (*Commander, error) {
 	c := &Commander{
-		tag: config.Tag,
+		tag:    config.Tag,
+		listen: config.Listen,
 	}
 
 	common.Must(core.RequireFeatures(ctx, func(om outbound.Manager) {
@@ -44,7 +47,7 @@ func NewCommander(ctx context.Context, config *Config) (*Commander, error) {
 		}
 		service, ok := rawService.(Service)
 		if !ok {
-			return nil, newError("not a Service.")
+			return nil, errors.New("not a Service.")
 		}
 		c.services = append(c.services, service)
 	}
@@ -66,19 +69,44 @@ func (c *Commander) Start() error {
 	}
 	c.Unlock()
 
+	listen := func(listener net.Listener) {
+		if err := c.server.Serve(listener); err != nil {
+			errors.LogErrorInner(context.Background(), err, "failed to start grpc server")
+		}
+	}
+
+	if len(c.listen) > 0 {
+		var addr net.Addr
+
+		if strings.HasPrefix(c.listen, "/") || strings.HasPrefix(c.listen, "@") {
+			addr = &net.UnixAddr{Name: c.listen, Net: "unix"}
+		} else {
+			tcpAddr, err := net.ResolveTCPAddr("tcp", c.listen)
+			if err != nil {
+				errors.LogErrorInner(context.Background(), err, "API server failed to parse listen address ", c.listen)
+				return err
+			}
+			addr = tcpAddr
+		}
+		l, err := internet.ListenSystem(context.Background(), addr, nil)
+		if err != nil {
+			errors.LogErrorInner(context.Background(), err, "API server failed to listen on ", c.listen)
+			return err
+		}
+		errors.LogInfo(context.Background(), "API server listening on ", l.Addr())
+		go listen(l)
+		return nil
+	}
+
 	listener := &OutboundListener{
 		buffer: make(chan net.Conn, 4),
 		done:   done.New(),
 	}
 
-	go func() {
-		if err := c.server.Serve(listener); err != nil {
-			newError("failed to start grpc server").Base(err).AtError().WriteToLog()
-		}
-	}()
+	go listen(listener)
 
 	if err := c.ohm.RemoveHandler(context.Background(), c.tag); err != nil {
-		newError("failed to remove existing handler").WriteToLog()
+		errors.LogInfoInner(context.Background(), err, "failed to remove existing handler")
 	}
 
 	return c.ohm.AddHandler(context.Background(), &Outbound{

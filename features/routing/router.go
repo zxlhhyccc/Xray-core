@@ -16,6 +16,7 @@ type Router interface {
 	PickRoute(ctx Context) (Route, error)
 	AddRule(config *serial.TypedMessage, shouldAppend bool) error
 	RemoveRule(tag string) error
+	ListRule() []Route
 }
 
 // Route is the routing result of Router feature.
@@ -30,6 +31,9 @@ type Route interface {
 
 	// GetOutboundTag returns the tag of the outbound the connection was dispatched to.
 	GetOutboundTag() string
+
+	// GetRuleTag returns the matching rule tag for debugging if exists
+	GetRuleTag() string
 }
 
 // RouterType return the type of Router interface. Can be used to implement common.HasType.
@@ -60,6 +64,11 @@ func (DefaultRouter) AddRule(config *serial.TypedMessage, shouldAppend bool) err
 // RemoveRule implements Router.
 func (DefaultRouter) RemoveRule(tag string) error {
 	return common.ErrNoClue
+}
+
+// ListRule implements Router.
+func (DefaultRouter) ListRule() []Route {
+	return nil
 }
 
 // Start implements common.Runnable.

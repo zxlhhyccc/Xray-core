@@ -7,6 +7,7 @@ import (
 	"github.com/golang/mock/gomock"
 	. "github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/dns"
@@ -45,7 +46,9 @@ func TestSimpleRouter(t *testing.T) {
 		HandlerSelector: mockHs,
 	}, nil))
 
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.DomainAddress("example.com"), 80),
+	}})
 	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
 	common.Must(err)
 	if tag := route.GetOutboundTag(); tag != "test" {
@@ -86,7 +89,9 @@ func TestSimpleBalancer(t *testing.T) {
 		HandlerSelector: mockHs,
 	}, nil))
 
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.DomainAddress("example.com"), 80),
+	}})
 	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
 	common.Must(err)
 	if tag := route.GetOutboundTag(); tag != "test" {
@@ -151,10 +156,13 @@ func TestIPOnDemand(t *testing.T) {
 				TargetTag: &RoutingRule_Tag{
 					Tag: "test",
 				},
-				Cidr: []*CIDR{
+				Ip: []*geodata.IPRule{
 					{
-						Ip:     []byte{192, 168, 0, 0},
-						Prefix: 16,
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{192, 168, 0, 0}, Prefix: 16},
+							},
+						},
 					},
 				},
 			},
@@ -169,12 +177,14 @@ func TestIPOnDemand(t *testing.T) {
 		IPv4Enable: true,
 		IPv6Enable: true,
 		FakeEnable: false,
-	}).Return([]net.IP{{192, 168, 0, 1}}, nil).AnyTimes()
+	}).Return([]net.IP{{192, 168, 0, 1}}, uint32(600), nil).AnyTimes()
 
 	r := new(Router)
 	common.Must(r.Init(context.TODO(), config, mockDNS, nil, nil))
 
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.DomainAddress("example.com"), 80),
+	}})
 	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
 	common.Must(err)
 	if tag := route.GetOutboundTag(); tag != "test" {
@@ -190,10 +200,13 @@ func TestIPIfNonMatchDomain(t *testing.T) {
 				TargetTag: &RoutingRule_Tag{
 					Tag: "test",
 				},
-				Cidr: []*CIDR{
+				Ip: []*geodata.IPRule{
 					{
-						Ip:     []byte{192, 168, 0, 0},
-						Prefix: 16,
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{192, 168, 0, 0}, Prefix: 16},
+							},
+						},
 					},
 				},
 			},
@@ -208,12 +221,14 @@ func TestIPIfNonMatchDomain(t *testing.T) {
 		IPv4Enable: true,
 		IPv6Enable: true,
 		FakeEnable: false,
-	}).Return([]net.IP{{192, 168, 0, 1}}, nil).AnyTimes()
+	}).Return([]net.IP{{192, 168, 0, 1}}, uint32(600), nil).AnyTimes()
 
 	r := new(Router)
 	common.Must(r.Init(context.TODO(), config, mockDNS, nil, nil))
 
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)})
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.DomainAddress("example.com"), 80),
+	}})
 	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
 	common.Must(err)
 	if tag := route.GetOutboundTag(); tag != "test" {
@@ -229,10 +244,13 @@ func TestIPIfNonMatchIP(t *testing.T) {
 				TargetTag: &RoutingRule_Tag{
 					Tag: "test",
 				},
-				Cidr: []*CIDR{
+				Ip: []*geodata.IPRule{
 					{
-						Ip:     []byte{127, 0, 0, 0},
-						Prefix: 8,
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{127, 0, 0, 0}, Prefix: 8},
+							},
+						},
 					},
 				},
 			},
@@ -247,7 +265,9 @@ func TestIPIfNonMatchIP(t *testing.T) {
 	r := new(Router)
 	common.Must(r.Init(context.TODO(), config, mockDNS, nil, nil))
 
-	ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{Target: net.TCPDestination(net.LocalHostIP, 80)})
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{
+		Target: net.TCPDestination(net.LocalHostIP, 80),
+	}})
 	route, err := r.PickRoute(routing_session.AsRoutingContext(ctx))
 	common.Must(err)
 	if tag := route.GetOutboundTag(); tag != "test" {

@@ -22,27 +22,23 @@ import (
 
 // Client is a inbound handler for trojan protocol
 type Client struct {
-	serverPicker  protocol.ServerPicker
+	server        *protocol.ServerSpec
 	policyManager policy.Manager
 }
 
 // NewClient create a new trojan client.
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
-	serverList := protocol.NewServerList()
-	for _, rec := range config.Server {
-		s, err := protocol.NewServerSpecFromPB(rec)
-		if err != nil {
-			return nil, newError("failed to parse server spec").Base(err)
-		}
-		serverList.AddServer(s)
+	if config.Server == nil {
+		return nil, errors.New(`no target server found`)
 	}
-	if serverList.Size() == 0 {
-		return nil, newError("0 server")
+	server, err := protocol.NewServerSpecFromPB(config.Server)
+	if err != nil {
+		return nil, errors.New("failed to get server spec").Base(err)
 	}
 
 	v := core.MustFromContext(ctx)
 	client := &Client{
-		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
+		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 	}
 	return client, nil
@@ -50,24 +46,21 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 
 // Process implements OutboundHandler.Process().
 func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
-	outbound := session.OutboundFromContext(ctx)
-	if outbound == nil || !outbound.Target.IsValid() {
-		return newError("target not specified")
+	outbounds := session.OutboundsFromContext(ctx)
+	ob := outbounds[len(outbounds)-1]
+	if !ob.Target.IsValid() {
+		return errors.New("target not specified")
 	}
-	outbound.Name = "trojan"
-	inbound := session.InboundFromContext(ctx)
-	if inbound != nil {
-		inbound.SetCanSpliceCopy(3)
-	}
-	destination := outbound.Target
+	ob.Name = "trojan"
+	ob.CanSpliceCopy = 3
+	destination := ob.Target
 	network := destination.Network
 
-	var server *protocol.ServerSpec
+	server := c.server
 	var conn stat.Connection
 
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
-		server = c.serverPicker.PickServer()
-		rawConn, err := dialer.Dial(ctx, server.Destination())
+		rawConn, err := dialer.Dial(ctx, server.Destination)
 		if err != nil {
 			return err
 		}
@@ -76,16 +69,16 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return nil
 	})
 	if err != nil {
-		return newError("failed to find an available destination").AtWarning().Base(err)
+		return errors.New("failed to find an available destination").Base(err)
 	}
-	newError("tunneling request to ", destination, " via ", server.Destination().NetAddr()).WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "tunneling request to ", destination, " via ", server.Destination.NetAddr())
 
 	defer conn.Close()
 
-	user := server.PickUser()
+	user := server.User
 	account, ok := user.Account.(*MemoryAccount)
 	if !ok {
-		return newError("user account is not valid")
+		return errors.New("user account is not valid")
 	}
 
 	var newCtx context.Context
@@ -123,21 +116,21 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 		// write some request payload to buffer
 		if err = buf.CopyOnceTimeout(link.Reader, bodyWriter, time.Millisecond*100); err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout {
-			return newError("failed to write A request payload").Base(err).AtWarning()
+			return errors.New("failed to write A request payload").Base(err)
 		}
 
-		// Flush; bufferWriter.WriteMultiBufer now is bufferWriter.writer.WriteMultiBuffer
+		// Flush; bufferWriter.WriteMultiBuffer now is bufferWriter.writer.WriteMultiBuffer
 		if err = bufferWriter.SetBuffered(false); err != nil {
-			return newError("failed to flush payload").Base(err).AtWarning()
+			return errors.New("failed to flush payload").Base(err)
 		}
 
 		// Send header if not sent yet
 		if _, err = connWriter.Write([]byte{}); err != nil {
-			return err.(*errors.Error).AtWarning()
+			return err
 		}
 
 		if err = buf.Copy(link.Reader, bodyWriter, buf.UpdateActivity(timer)); err != nil {
-			return newError("failed to transfer request payload").Base(err).AtInfo()
+			return errors.New("failed to transfer request payload").Base(err)
 		}
 
 		return nil
@@ -163,7 +156,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	responseDoneAndCloseWriter := task.OnSuccess(getResponse, task.Close(link.Writer))
 	if err := task.Run(ctx, postRequest, responseDoneAndCloseWriter); err != nil {
-		return newError("connection ends").Base(err)
+		return errors.New("connection ends").Base(err)
 	}
 
 	return nil

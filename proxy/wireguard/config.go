@@ -1,32 +1,60 @@
 package wireguard
 
-func (c *DeviceConfig) preferIP4() bool {
-	return c.DomainStrategy == DeviceConfig_FORCE_IP ||
-		c.DomainStrategy == DeviceConfig_FORCE_IP4 ||
-		c.DomainStrategy == DeviceConfig_FORCE_IP46
-}
+import (
+	"encoding/hex"
+	"net/netip"
 
-func (c *DeviceConfig) preferIP6() bool {
-	return c.DomainStrategy == DeviceConfig_FORCE_IP ||
-		c.DomainStrategy == DeviceConfig_FORCE_IP6 ||
-		c.DomainStrategy == DeviceConfig_FORCE_IP64
-}
+	"github.com/xtls/xray-core/common/protocol"
+	"google.golang.org/protobuf/proto"
+)
 
-func (c *DeviceConfig) hasFallback() bool {
-	return c.DomainStrategy == DeviceConfig_FORCE_IP46 || c.DomainStrategy == DeviceConfig_FORCE_IP64
-}
-
-func (c *DeviceConfig) fallbackIP4() bool {
-	return c.DomainStrategy == DeviceConfig_FORCE_IP64
-}
-
-func (c *DeviceConfig) fallbackIP6() bool {
-	return c.DomainStrategy == DeviceConfig_FORCE_IP46
-}
-
-func (c *DeviceConfig) createTun() tunCreator {
-	if c.KernelMode {
-		return createKernelTun
+func (p *PeerConfig) AsAccount() (protocol.Account, error) {
+	pub, err := ParseKey(p.PublicKey)
+	if err != nil {
+		return nil, err
 	}
-	return createGVisorTun
+
+	allowedIPs := make([]netip.Prefix, 0, len(p.AllowedIps))
+	for i := range p.AllowedIps {
+		p, err := netip.ParsePrefix(p.AllowedIps[i])
+		if err != nil {
+			return nil, err
+		}
+		allowedIPs = append(allowedIPs, p)
+	}
+
+	return &MemoryAccount{
+		Pub:          *pub,
+		AllowedIPs:   allowedIPs,
+		PreSharedKey: p.PreSharedKey,
+		KeepAlive:    p.KeepAlive,
+	}, nil
+}
+
+type MemoryAccount struct {
+	Pub          [32]byte
+	AllowedIPs   []netip.Prefix
+	PreSharedKey string
+	KeepAlive    string
+}
+
+func (a *MemoryAccount) Equals(other protocol.Account) bool {
+	if b, ok := other.(*MemoryAccount); ok {
+		return a.Pub == b.Pub
+	}
+	return false
+}
+
+func (a *MemoryAccount) ToProto() proto.Message {
+	allowedIPs := make([]string, 0, len(a.AllowedIPs))
+	for i := range a.AllowedIPs {
+		allowedIPs = append(allowedIPs, a.AllowedIPs[i].String())
+	}
+
+	return &PeerConfig{
+		PublicKey:    hex.EncodeToString(a.Pub[:]),
+		AllowedIps:   allowedIPs,
+		PreSharedKey: a.PreSharedKey,
+		KeepAlive:    a.KeepAlive,
+	}
 }

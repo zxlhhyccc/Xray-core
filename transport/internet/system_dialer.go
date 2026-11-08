@@ -2,17 +2,23 @@ package internet
 
 import (
 	"context"
+	go_errors "errors"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/sagernet/sing/common/control"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 )
 
-var effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
+var (
+	Controllers           []func(network, address string, c syscall.RawConn) error
+	ControllersLock       sync.Mutex
+	effectiveSystemDialer SystemDialer = &DefaultSystemDialer{}
+)
 
 type SystemDialer interface {
 	Dial(ctx context.Context, source net.Address, destination net.Destination, sockopt *SocketConfig) (net.Conn, error)
@@ -20,9 +26,8 @@ type SystemDialer interface {
 }
 
 type DefaultSystemDialer struct {
-	controllers []control.Func
-	dns         dns.Client
-	obm         outbound.Manager
+	dns dns.Client
+	obm outbound.Manager
 }
 
 func resolveSrcAddr(network net.Network, src net.Address) net.Addr {
@@ -43,77 +48,123 @@ func resolveSrcAddr(network net.Network, src net.Address) net.Addr {
 	}
 }
 
-func hasBindAddr(sockopt *SocketConfig) bool {
-	return sockopt != nil && len(sockopt.BindAddress) > 0 && sockopt.BindPort > 0
-}
-
 func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *SocketConfig) (net.Conn, error) {
-	newError("dialing to " + dest.String()).AtDebug().WriteToLog()
+	errors.LogDebug(ctx, "dialing to "+dest.String())
 
-	if dest.Network == net.Network_UDP && !hasBindAddr(sockopt) {
-		srcAddr := resolveSrcAddr(net.Network_UDP, src)
-		if srcAddr == nil {
-			srcAddr = &net.UDPAddr{
-				IP:   []byte{0, 0, 0, 0},
-				Port: 0,
-			}
-		}
-		packetConn, err := ListenSystemPacket(ctx, srcAddr, sockopt)
-		if err != nil {
-			return nil, err
-		}
+	if dest.Network == net.Network_UDP {
 		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
 		if err != nil {
 			return nil, err
 		}
-		if sockopt != nil {
-			sys, err := packetConn.(*net.UDPConn).SyscallConn()
-			if err != nil {
-				return nil, err
+		srcAddr := resolveSrcAddr(net.Network_UDP, src)
+		if srcAddr == nil {
+			// some OS don't support mapped IPv4 dual stack
+			// and need to select 0.0.0.0 or [::] manually based on the destination
+			wildcard := net.AnyIP.IP()
+			if destAddr.IP.To4() == nil {
+				wildcard = net.AnyIPv6.IP()
 			}
-			sys.Control(func(fd uintptr) {
-				if err := applyOutboundSocketOptions("udp", dest.NetAddr(), fd, sockopt); err != nil {
-					newError("failed to apply socket options").Base(err).WriteToLog(session.ExportIDToError(ctx))
-				}
-			})
+			srcAddr = &net.UDPAddr{
+				IP:   wildcard,
+				Port: 0,
+			}
 		}
-		return &PacketConnWrapper{
-			Conn: packetConn,
-			Dest: destAddr,
+		var lc net.ListenConfig
+		if sockopt != nil || len(Controllers) > 0 {
+			lc.Control = func(network, _ string, c syscall.RawConn) error {
+				// ListenPacket supplies a local address; dialer controllers need the destination.
+				for _, ctl := range Controllers {
+					if err := ctl(network, destAddr.String(), c); err != nil {
+						return errors.New("failed to apply external controller").Base(err)
+					}
+				}
+				if sockopt != nil {
+					var sockErr, controlErr error
+					controlErr = c.Control(func(fd uintptr) {
+						if sockErr = applyOutboundSocketOptions(network, destAddr.String(), fd, sockopt); sockErr != nil {
+							errors.LogInfoInner(ctx, sockErr, "failed to apply socket options")
+						}
+					})
+					if _, ok := sockErr.(*BindError); ok {
+						return sockErr
+					}
+					return controlErr
+				}
+				return nil
+			}
+		}
+		packetConn, err := lc.ListenPacket(ctx, srcAddr.Network(), srcAddr.String())
+		var bindErr *BindError
+		if err != nil && runtime.GOOS == "windows" && go_errors.As(err, &bindErr) {
+			// Keep dual-stack UDP when possible. If the interface cannot bind both
+			// families, retry a socket that cannot send on the unbound family.
+			network := "udp6"
+			if destAddr.IP.To4() != nil {
+				network = "udp4"
+			}
+			packetConn, err = lc.ListenPacket(ctx, network, srcAddr.String())
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &net.PacketConnWrapper{
+			PacketConn: packetConn,
+			Dest:       destAddr,
 		}, nil
 	}
-	goStdKeepAlive := time.Duration(0)
-	if sockopt != nil && (sockopt.TcpKeepAliveInterval != 0 || sockopt.TcpKeepAliveIdle != 0) {
-		goStdKeepAlive = time.Duration(-1)
+	// Chrome defaults
+	keepAliveConfig := net.KeepAliveConfig{
+		Enable:   true,
+		Idle:     45 * time.Second,
+		Interval: 45 * time.Second,
+		Count:    -1,
+	}
+	keepAlive := time.Duration(0)
+	if sockopt != nil {
+		if sockopt.TcpKeepAliveIdle*sockopt.TcpKeepAliveInterval < 0 {
+			return nil, errors.New("invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: ", sockopt.TcpKeepAliveIdle, " ", sockopt.TcpKeepAliveInterval)
+		}
+		if sockopt.TcpKeepAliveIdle < 0 || sockopt.TcpKeepAliveInterval < 0 {
+			keepAlive = -1
+			keepAliveConfig.Enable = false
+		}
+		if sockopt.TcpKeepAliveIdle > 0 {
+			keepAliveConfig.Idle = time.Duration(sockopt.TcpKeepAliveIdle) * time.Second
+		}
+		if sockopt.TcpKeepAliveInterval > 0 {
+			keepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
+		}
 	}
 	dialer := &net.Dialer{
-		Timeout:   time.Second * 16,
-		LocalAddr: resolveSrcAddr(dest.Network, src),
-		KeepAlive: goStdKeepAlive,
+		Timeout:         time.Second * 16,
+		LocalAddr:       resolveSrcAddr(dest.Network, src),
+		KeepAlive:       keepAlive,
+		KeepAliveConfig: keepAliveConfig,
 	}
 
-	if sockopt != nil || len(d.controllers) > 0 {
+	if sockopt != nil || len(Controllers) > 0 {
 		if sockopt != nil && sockopt.TcpMptcp {
 			dialer.SetMultipathTCP(true)
 		}
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			for _, ctl := range d.controllers {
+			for _, ctl := range Controllers {
 				if err := ctl(network, address, c); err != nil {
-					newError("failed to apply external controller").Base(err).WriteToLog(session.ExportIDToError(ctx))
+					return errors.New("failed to apply external controller").Base(err)
 				}
 			}
-			return c.Control(func(fd uintptr) {
-				if sockopt != nil {
-					if err := applyOutboundSocketOptions(network, address, fd, sockopt); err != nil {
-						newError("failed to apply socket options").Base(err).WriteToLog(session.ExportIDToError(ctx))
+			if sockopt != nil {
+				var sockErr, controlErr error
+				controlErr = c.Control(func(fd uintptr) {
+					if sockErr = applyOutboundSocketOptions(network, address, fd, sockopt); sockErr != nil {
+						errors.LogInfoInner(ctx, sockErr, "failed to apply socket options")
 					}
-					if dest.Network == net.Network_UDP && hasBindAddr(sockopt) {
-						if err := bindAddr(fd, sockopt.BindAddress, sockopt.BindPort); err != nil {
-							newError("failed to bind source address to ", sockopt.BindAddress).Base(err).WriteToLog(session.ExportIDToError(ctx))
-						}
-					}
+				})
+				if _, ok := sockErr.(*BindError); ok {
+					return sockErr
 				}
-			})
+				return controlErr
+			}
+			return nil
 		}
 	}
 
@@ -122,52 +173,6 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 
 func (d *DefaultSystemDialer) DestIpAddress() net.IP {
 	return nil
-}
-
-type PacketConnWrapper struct {
-	Conn net.PacketConn
-	Dest net.Addr
-}
-
-func (c *PacketConnWrapper) Close() error {
-	return c.Conn.Close()
-}
-
-func (c *PacketConnWrapper) LocalAddr() net.Addr {
-	return c.Conn.LocalAddr()
-}
-
-func (c *PacketConnWrapper) RemoteAddr() net.Addr {
-	return c.Dest
-}
-
-func (c *PacketConnWrapper) Write(p []byte) (int, error) {
-	return c.Conn.WriteTo(p, c.Dest)
-}
-
-func (c *PacketConnWrapper) Read(p []byte) (int, error) {
-	n, _, err := c.Conn.ReadFrom(p)
-	return n, err
-}
-
-func (c *PacketConnWrapper) WriteTo(p []byte, d net.Addr) (int, error) {
-	return c.Conn.WriteTo(p, d)
-}
-
-func (c *PacketConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
-	return c.Conn.ReadFrom(p)
-}
-
-func (c *PacketConnWrapper) SetDeadline(t time.Time) error {
-	return c.Conn.SetDeadline(t)
-}
-
-func (c *PacketConnWrapper) SetReadDeadline(t time.Time) error {
-	return c.Conn.SetReadDeadline(t)
-}
-
-func (c *PacketConnWrapper) SetWriteDeadline(t time.Time) error {
-	return c.Conn.SetWriteDeadline(t)
 }
 
 type SystemDialerAdapter interface {
@@ -205,19 +210,40 @@ func UseAlternativeSystemDialer(dialer SystemDialer) {
 
 // RegisterDialerController adds a controller to the effective system dialer.
 // The controller can be used to operate on file descriptors before they are put into use.
+// It receives the network and resolved remote address, as in net.Dialer.Control.
 // It only works when effective dialer is the default dialer.
 //
 // xray:api:beta
-func RegisterDialerController(ctl control.Func) error {
+func RegisterDialerController(ctl func(network, address string, c syscall.RawConn) error) error {
 	if ctl == nil {
-		return newError("nil listener controller")
+		return errors.New("nil listener controller")
 	}
 
-	dialer, ok := effectiveSystemDialer.(*DefaultSystemDialer)
+	ControllersLock.Lock()
+	Controllers = append(Controllers, ctl)
+	ControllersLock.Unlock()
+
+	_, ok := effectiveSystemDialer.(*DefaultSystemDialer)
 	if !ok {
-		return newError("RegisterListenerController not supported in custom dialer")
+		return errors.New("RegisterListenerController not supported in custom dialer")
 	}
 
-	dialer.controllers = append(dialer.controllers, ctl)
 	return nil
+}
+
+type FakePacketConn struct {
+	net.Conn
+}
+
+func (c *FakePacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, err = c.Read(p)
+	return n, &net.UDPAddr{IP: c.Conn.RemoteAddr().(*net.TCPAddr).IP, Port: c.Conn.RemoteAddr().(*net.TCPAddr).Port}, err
+}
+
+func (c *FakePacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+	return c.Write(p)
+}
+
+func (c *FakePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
 }

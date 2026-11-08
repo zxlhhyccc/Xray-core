@@ -1,10 +1,11 @@
 package router
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
-	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/routing"
 )
@@ -14,6 +15,7 @@ type Rule struct {
 	RuleTag   string
 	Balancer  *Balancer
 	Condition Condition
+	Webhook   *WebhookNotifier
 }
 
 func (r *Rule) GetTag() (string, error) {
@@ -31,80 +33,40 @@ func (r *Rule) Apply(ctx routing.Context) bool {
 func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	conds := NewConditionChan()
 
-	if len(rr.Domain) > 0 {
-		switch rr.DomainMatcher {
-		case "linear":
-			matcher, err := NewDomainMatcher(rr.Domain)
-			if err != nil {
-				return nil, newError("failed to build domain condition").Base(err)
-			}
-			conds.Add(matcher)
-		case "mph", "hybrid":
-			fallthrough
-		default:
-			matcher, err := NewMphMatcherGroup(rr.Domain)
-			if err != nil {
-				return nil, newError("failed to build domain condition with MphDomainMatcher").Base(err)
-			}
-			newError("MphDomainMatcher is enabled for ", len(rr.Domain), " domain rule(s)").AtDebug().WriteToLog()
-			conds.Add(matcher)
-		}
-	}
-
-	if len(rr.UserEmail) > 0 {
-		conds.Add(NewUserMatcher(rr.UserEmail))
+	if len(rr.LocalOs) > 0 {
+		conds.Add(NewLocalOSMatcher(rr.LocalOs))
 	}
 
 	if len(rr.InboundTag) > 0 {
 		conds.Add(NewInboundTagMatcher(rr.InboundTag))
 	}
 
-	if rr.PortList != nil {
-		conds.Add(NewPortMatcher(rr.PortList, false))
-	} else if rr.PortRange != nil {
-		conds.Add(NewPortMatcher(&net.PortList{Range: []*net.PortRange{rr.PortRange}}, false))
-	}
-
-	if rr.SourcePortList != nil {
-		conds.Add(NewPortMatcher(rr.SourcePortList, true))
-	}
-
 	if len(rr.Networks) > 0 {
 		conds.Add(NewNetworkMatcher(rr.Networks))
-	} else if rr.NetworkList != nil {
-		conds.Add(NewNetworkMatcher(rr.NetworkList.Network))
-	}
-
-	if len(rr.Geoip) > 0 {
-		cond, err := NewMultiGeoIPMatcher(rr.Geoip, false)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
-	} else if len(rr.Cidr) > 0 {
-		cond, err := NewMultiGeoIPMatcher([]*GeoIP{{Cidr: rr.Cidr}}, false)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
-	}
-
-	if len(rr.SourceGeoip) > 0 {
-		cond, err := NewMultiGeoIPMatcher(rr.SourceGeoip, true)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
-	} else if len(rr.SourceCidr) > 0 {
-		cond, err := NewMultiGeoIPMatcher([]*GeoIP{{Cidr: rr.SourceCidr}}, true)
-		if err != nil {
-			return nil, err
-		}
-		conds.Add(cond)
 	}
 
 	if len(rr.Protocol) > 0 {
 		conds.Add(NewProtocolMatcher(rr.Protocol))
+	}
+
+	if rr.PortList != nil {
+		conds.Add(NewPortMatcher(rr.PortList, MatcherAsType_Target))
+	}
+
+	if rr.SourcePortList != nil {
+		conds.Add(NewPortMatcher(rr.SourcePortList, MatcherAsType_Source))
+	}
+
+	if rr.LocalPortList != nil {
+		conds.Add(NewPortMatcher(rr.LocalPortList, MatcherAsType_Local))
+	}
+
+	if rr.VlessRouteList != nil {
+		conds.Add(NewPortMatcher(rr.VlessRouteList, MatcherAsType_VlessRoute))
+	}
+
+	if len(rr.UserEmail) > 0 {
+		conds.Add(NewUserMatcher(rr.UserEmail))
 	}
 
 	if len(rr.Attributes) > 0 {
@@ -115,8 +77,45 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 		conds.Add(&AttributeMatcher{configuredKeys})
 	}
 
+	if len(rr.Ip) > 0 {
+		cond, err := NewIPMatcher(rr.Ip, MatcherAsType_Target)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+	}
+
+	if len(rr.SourceIp) > 0 {
+		cond, err := NewIPMatcher(rr.SourceIp, MatcherAsType_Source)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+	}
+
+	if len(rr.LocalIp) > 0 {
+		cond, err := NewIPMatcher(rr.LocalIp, MatcherAsType_Local)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+		errors.LogWarning(context.Background(), "Due to some limitations, in UDP connections, localIP is always equal to listen interface IP, so \"localIP\" rule condition does not work properly on UDP inbound connections that listen on all interfaces")
+	}
+
+	if len(rr.Domain) > 0 {
+		cond, err := NewDomainMatcher(rr.Domain)
+		if err != nil {
+			return nil, err
+		}
+		conds.Add(cond)
+	}
+
+	if len(rr.Process) > 0 {
+		conds.Add(NewProcessNameMatcher(rr.Process))
+	}
+
 	if conds.Len() == 0 {
-		return nil, newError("this rule has no effective fields").AtWarning()
+		return nil, errors.New("this rule has no effective fields")
 	}
 
 	return conds, nil
@@ -135,7 +134,7 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 	case "roundrobin":
 		return &Balancer{
 			selectors:   br.OutboundSelector,
-			strategy:    &RoundRobinStrategy{},
+			strategy:    &RoundRobinStrategy{FallbackTag: br.FallbackTag},
 			fallbackTag: br.FallbackTag,
 			ohm:         ohm,
 		}, nil
@@ -146,7 +145,7 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 		}
 		s, ok := i.(*StrategyLeastLoadConfig)
 		if !ok {
-			return nil, newError("not a StrategyLeastLoadConfig").AtError()
+			return nil, errors.New("not a StrategyLeastLoadConfig")
 		}
 		leastLoadStrategy := NewLeastLoadStrategy(s)
 		return &Balancer{
@@ -162,9 +161,9 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 			selectors:   br.OutboundSelector,
 			ohm:         ohm,
 			fallbackTag: br.FallbackTag,
-			strategy:    &RandomStrategy{},
+			strategy:    &RandomStrategy{FallbackTag: br.FallbackTag},
 		}, nil
 	default:
-		return nil, newError("unrecognized balancer type")
+		return nil, errors.New("unrecognized balancer type")
 	}
 }

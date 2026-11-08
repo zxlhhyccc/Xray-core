@@ -42,10 +42,10 @@ func TestRequestSerialization(t *testing.T) {
 	buffer := buf.StackNew()
 	common.Must(EncodeRequestHeader(&buffer, expectedRequest, expectedAddons))
 
-	Validator := new(vless.Validator)
+	Validator := new(vless.MemoryValidator)
 	Validator.Add(user)
 
-	actualRequest, actualAddons, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
+	_, actualRequest, actualAddons, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
 	common.Must(err)
 
 	if r := cmp.Diff(actualRequest, expectedRequest, cmp.AllowUnexported(protocol.ID{})); r != "" {
@@ -53,7 +53,7 @@ func TestRequestSerialization(t *testing.T) {
 	}
 
 	addonsComparer := func(x, y *Addons) bool {
-		return (x.Flow == y.Flow) && (cmp.Equal(x.Seed, y.Seed))
+		return (x.Flow == y.Flow) && cmp.Equal(x.Seed, y.Seed)
 	}
 	if r := cmp.Diff(actualAddons, expectedAddons, cmp.Comparer(addonsComparer)); r != "" {
 		t.Error(r)
@@ -83,10 +83,10 @@ func TestInvalidRequest(t *testing.T) {
 	buffer := buf.StackNew()
 	common.Must(EncodeRequestHeader(&buffer, expectedRequest, expectedAddons))
 
-	Validator := new(vless.Validator)
+	Validator := new(vless.MemoryValidator)
 	Validator.Add(user)
 
-	_, _, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
+	_, _, _, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
 	if err == nil {
 		t.Error("nil error")
 	}
@@ -114,10 +114,10 @@ func TestMuxRequest(t *testing.T) {
 	buffer := buf.StackNew()
 	common.Must(EncodeRequestHeader(&buffer, expectedRequest, expectedAddons))
 
-	Validator := new(vless.Validator)
+	Validator := new(vless.MemoryValidator)
 	Validator.Add(user)
 
-	actualRequest, actualAddons, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
+	_, actualRequest, actualAddons, _, err := DecodeRequestHeader(false, nil, &buffer, Validator)
 	common.Must(err)
 
 	if r := cmp.Diff(actualRequest, expectedRequest, cmp.AllowUnexported(protocol.ID{})); r != "" {
@@ -125,7 +125,7 @@ func TestMuxRequest(t *testing.T) {
 	}
 
 	addonsComparer := func(x, y *Addons) bool {
-		return (x.Flow == y.Flow) && (cmp.Equal(x.Seed, y.Seed))
+		return (x.Flow == y.Flow) && cmp.Equal(x.Seed, y.Seed)
 	}
 	if r := cmp.Diff(actualAddons, expectedAddons, cmp.Comparer(addonsComparer)); r != "" {
 		t.Error(r)

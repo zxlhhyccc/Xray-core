@@ -3,8 +3,13 @@ package conf
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"strconv"
 	"strings"
 
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/proxy/wireguard"
 	"google.golang.org/protobuf/proto"
 )
@@ -15,29 +20,33 @@ type WireGuardPeerConfig struct {
 	Endpoint     string   `json:"endpoint"`
 	KeepAlive    uint32   `json:"keepAlive"`
 	AllowedIPs   []string `json:"allowedIPs,omitempty"`
+
+	Level uint32 `json:"level"`
+	Email string `json:"email"`
 }
 
-func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
+func (c *WireGuardPeerConfig) Build() (*wireguard.PeerConfig, error) {
 	var err error
 	config := new(wireguard.PeerConfig)
 
 	if c.PublicKey != "" {
-		config.PublicKey, err = parseWireGuardKey(c.PublicKey)
+		config.PublicKey, err = ParseWireGuardKey(c.PublicKey)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if c.PreSharedKey != "" {
-		config.PreSharedKey, err = parseWireGuardKey(c.PreSharedKey)
+		config.PreSharedKey, err = ParseWireGuardKey(c.PreSharedKey)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	config.Endpoint = c.Endpoint
-	// default 0
-	config.KeepAlive = c.KeepAlive
+	if c.KeepAlive != 0 {
+		config.KeepAlive = strconv.FormatUint(uint64(c.KeepAlive), 10)
+	}
 	if c.AllowedIPs == nil {
 		config.AllowedIps = []string{"0.0.0.0/0", "::0/0"}
 	} else {
@@ -50,23 +59,22 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 type WireGuardConfig struct {
 	IsClient bool `json:""`
 
-	KernelMode     *bool                  `json:"kernelMode"`
-	SecretKey      string                 `json:"secretKey"`
-	Address        []string               `json:"address"`
-	Peers          []*WireGuardPeerConfig `json:"peers"`
-	MTU            int32                  `json:"mtu"`
-	NumWorkers     int32                  `json:"workers"`
-	Reserved       []byte                 `json:"reserved"`
-	DomainStrategy string                 `json:"domainStrategy"`
+	NoKernelTun bool                   `json:"noKernelTun"`
+	SecretKey   string                 `json:"secretKey"`
+	Address     []string               `json:"address"`
+	Peers       []*WireGuardPeerConfig `json:"peers"`
+	MTU         int32                  `json:"mtu"`
+	Reserved    []byte                 `json:"reserved"`
+	DNS         []string               `json:"remoteDNS"`
 }
 
 func (c *WireGuardConfig) Build() (proto.Message, error) {
 	config := new(wireguard.DeviceConfig)
 
 	var err error
-	config.SecretKey, err = parseWireGuardKey(c.SecretKey)
+	config.SecretKey, err = ParseWireGuardKey(c.SecretKey)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("invalid WireGuard secret key: %w", err)
 	}
 
 	if c.Address == nil {
@@ -76,14 +84,32 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 		config.Endpoint = c.Address
 	}
 
-	if c.Peers != nil {
+	if c.IsClient {
 		config.Peers = make([]*wireguard.PeerConfig, len(c.Peers))
 		for i, p := range c.Peers {
 			msg, err := p.Build()
 			if err != nil {
 				return nil, err
 			}
-			config.Peers[i] = msg.(*wireguard.PeerConfig)
+			config.Peers[i] = msg
+		}
+	} else {
+		config.Users = make([]*protocol.User, len(c.Peers))
+		processUser := func(idx int) error {
+			p := c.Peers[idx]
+			m, err := p.Build()
+			if err != nil {
+				return err
+			}
+			config.Users[idx] = &protocol.User{
+				Email:   p.Email,
+				Level:   p.Level,
+				Account: serial.ToTypedMessage(m),
+			}
+			return nil
+		}
+		if err := task.ParallelForN(len(c.Peers), processUser); err != nil {
+			return nil, err
 		}
 	}
 
@@ -92,50 +118,27 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 	} else {
 		config.Mtu = c.MTU
 	}
-	// these a fallback code exists in wireguard-go code,
-	// we don't need to process fallback manually
-	config.NumWorkers = c.NumWorkers
 
 	if len(c.Reserved) != 0 && len(c.Reserved) != 3 {
-		return nil, newError(`"reserved" should be empty or 3 bytes`)
+		return nil, errors.New(`"reserved" should be empty or 3 bytes`)
 	}
 	config.Reserved = c.Reserved
 
-	switch strings.ToLower(c.DomainStrategy) {
-	case "forceip", "":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP
-	case "forceipv4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP4
-	case "forceipv6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP6
-	case "forceipv4v6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP46
-	case "forceipv6v4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP64
-	default:
-		return nil, newError("unsupported domain strategy: ", c.DomainStrategy)
-	}
-
 	config.IsClient = c.IsClient
-	if c.KernelMode != nil {
-		config.KernelMode = *c.KernelMode
-		if config.KernelMode && !wireguard.KernelTunSupported() {
-			newError("kernel mode is not supported on your OS or permission is insufficient").AtWarning().WriteToLog()
-		}
-	} else {
-		config.KernelMode = wireguard.KernelTunSupported()
-		if config.KernelMode {
-			newError("kernel mode is enabled as it's supported and permission is sufficient").AtDebug().WriteToLog()
-		}
-	}
+	config.NoKernelTun = c.NoKernelTun
+	config.DNS = c.DNS
 
 	return config, nil
 }
 
-func parseWireGuardKey(str string) (string, error) {
+func ParseWireGuardKey(str string) (string, error) {
 	var err error
 
-	if len(str)%2 == 0 {
+	if str == "" {
+		return "", errors.New("key must not be empty")
+	}
+
+	if len(str) == 64 {
 		_, err = hex.DecodeString(str)
 		if err == nil {
 			return str, nil
@@ -153,5 +156,5 @@ func parseWireGuardKey(str string) (string, error) {
 		return hex.EncodeToString(dat), nil
 	}
 
-	return "", newError("failed to deserialize key").Base(err)
+	return "", errors.New("failed to deserialize key").Base(err)
 }

@@ -8,8 +8,8 @@ import (
 
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -41,28 +41,24 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	var listener net.Listener
 	var err error
+	var addr net.Addr
 	if port == net.Port(0) { // unix
-		listener, err = internet.ListenSystem(ctx, &net.UnixAddr{
-			Name: address.Domain(),
-			Net:  "unix",
-		}, streamSettings.SocketSettings)
-		if err != nil {
-			return nil, newError("failed to listen Unix Domain Socket on ", address).Base(err)
-		}
-		newError("listening Unix Domain Socket on ", address).WriteToLog(session.ExportIDToError(ctx))
-	} else {
-		listener, err = internet.ListenSystem(ctx, &net.TCPAddr{
-			IP:   address.IP(),
-			Port: int(port),
-		}, streamSettings.SocketSettings)
-		if err != nil {
-			return nil, newError("failed to listen TCP on ", address, ":", port).Base(err)
-		}
-		newError("listening TCP on ", address, ":", port).WriteToLog(session.ExportIDToError(ctx))
+		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
+	} else { // tcp
+		addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
 	}
+	if streamSettings.FinalMask != nil {
+		listener, err = streamSettings.FinalMask.Listen(ctx, addr)
+	} else {
+		listener, err = internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
+	}
+	if err != nil {
+		return nil, errors.New("failed to listen ", addr.Network(), " on ", address, ":", port).Base(err)
+	}
+	errors.LogInfo(ctx, "listening ", addr.Network(), " on ", address, ":", port)
 
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
-		newError("accepting PROXY protocol").AtWarning().WriteToLog(session.ExportIDToError(ctx))
+		errors.LogWarning(ctx, "accepting PROXY protocol")
 	}
 
 	l.listener = listener
@@ -72,16 +68,17 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.realityConfig = config.GetREALITYConfig()
+		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
 	}
 
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
 		if err != nil {
-			return nil, newError("invalid header settings").Base(err).AtError()
+			return nil, errors.New("invalid header settings").Base(err)
 		}
 		auth, err := internet.CreateConnectionAuthenticator(headerConfig)
 		if err != nil {
-			return nil, newError("invalid header settings.").Base(err).AtError()
+			return nil, errors.New("invalid header settings.").Base(err)
 		}
 		l.authConfig = auth
 	}
@@ -98,18 +95,19 @@ func (v *Listener) keepAccepting() {
 			if strings.Contains(errStr, "closed") {
 				break
 			}
-			newError("failed to accepted raw connections").Base(err).AtWarning().WriteToLog()
+			errors.LogWarningInner(context.Background(), err, "failed to accepted raw connections")
 			if strings.Contains(errStr, "too many") {
 				time.Sleep(time.Millisecond * 500)
 			}
 			continue
 		}
+
 		go func() {
 			if v.tlsConfig != nil {
 				conn = tls.Server(conn, v.tlsConfig)
 			} else if v.realityConfig != nil {
 				if conn, err = reality.Server(conn, v.realityConfig); err != nil {
-					newError(err).AtInfo().WriteToLog()
+					errors.LogInfo(context.Background(), err.Error())
 					return
 				}
 			}

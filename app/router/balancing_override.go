@@ -4,21 +4,6 @@ import (
 	sync "sync"
 )
 
-func (r *Router) OverrideBalancer(balancer string, target string) error {
-	var b *Balancer
-	for tag, bl := range r.balancers {
-		if tag == balancer {
-			b = bl
-			break
-		}
-	}
-	if b == nil {
-		return newError("balancer '", balancer, "' not found")
-	}
-	b.override.Put(target)
-	return nil
-}
-
 type overrideSettings struct {
 	target string
 }

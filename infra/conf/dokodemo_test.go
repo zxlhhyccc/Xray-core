@@ -19,22 +19,20 @@ func TestDokodemoConfig(t *testing.T) {
 				"address": "8.8.8.8",
 				"port": 53,
 				"network": "tcp",
-				"timeout": 10,
 				"followRedirect": true,
 				"userLevel": 1
 			}`,
 			Parser: loadJSON(creator),
 			Output: &dokodemo.Config{
-				Address: &net.IPOrDomain{
+				RewriteAddress: &net.IPOrDomain{
 					Address: &net.IPOrDomain_Ip{
 						Ip: []byte{8, 8, 8, 8},
 					},
 				},
-				Port:           53,
-				Networks:       []net.Network{net.Network_TCP},
-				Timeout:        10,
-				FollowRedirect: true,
-				UserLevel:      1,
+				RewritePort:     53,
+				AllowedNetworks: []net.Network{net.Network_TCP},
+				FollowRedirect:  true,
+				UserLevel:       1,
 			},
 		},
 	})

@@ -7,9 +7,12 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/transport"
@@ -27,11 +30,11 @@ type Portal struct {
 
 func NewPortal(config *PortalConfig, ohm outbound.Manager) (*Portal, error) {
 	if config.Tag == "" {
-		return nil, newError("portal tag is empty")
+		return nil, errors.New("portal tag is empty")
 	}
 
 	if config.Domain == "" {
-		return nil, newError("portal domain is empty")
+		return nil, errors.New("portal domain is empty")
 	}
 
 	picker, err := NewStaticMuxPicker()
@@ -62,24 +65,37 @@ func (p *Portal) Close() error {
 }
 
 func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) error {
-	outboundMeta := session.OutboundFromContext(ctx)
-	if outboundMeta == nil {
-		return newError("outbound metadata not found").AtError()
+	outbounds := session.OutboundsFromContext(ctx)
+	ob := outbounds[len(outbounds)-1]
+	if ob == nil {
+		return errors.New("outbound metadata not found")
 	}
 
-	if isDomain(outboundMeta.Target, p.domain) {
+	if isDomain(ob.Target, p.domain) {
 		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
 		if err != nil {
-			return newError("failed to create mux client worker").Base(err).AtWarning()
+			return errors.New("failed to create mux client worker").Base(err)
 		}
 
 		worker, err := NewPortalWorker(muxClient)
 		if err != nil {
-			return newError("failed to create portal worker").Base(err)
+			return errors.New("failed to create portal worker").Base(err)
 		}
 
 		p.picker.AddWorker(worker)
+
+		if _, ok := link.Reader.(*pipe.Reader); !ok {
+			select {
+			case <-ctx.Done():
+			case <-muxClient.WaitClosed():
+			}
+		}
 		return nil
+	}
+
+	if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil && ob.OriginalTarget.Address != ob.Target.Address {
+		link.Reader = &buf.EndpointOverrideReader{Reader: link.Reader, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
+		link.Writer = &buf.EndpointOverrideWriter{Writer: link.Writer, Dest: ob.Target.Address, OriginalDest: ob.OriginalTarget.Address}
 	}
 
 	return p.client.Dispatch(ctx, link)
@@ -96,8 +112,9 @@ func (o *Outbound) Tag() string {
 
 func (o *Outbound) Dispatch(ctx context.Context, link *transport.Link) {
 	if err := o.portal.HandleConnection(ctx, link); err != nil {
-		newError("failed to process reverse connection").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogInfoInner(ctx, err, "failed to process reverse connection")
 		common.Interrupt(link.Writer)
+		common.Interrupt(link.Reader)
 	}
 }
 
@@ -106,6 +123,16 @@ func (o *Outbound) Start() error {
 }
 
 func (o *Outbound) Close() error {
+	return nil
+}
+
+// SenderSettings implements outbound.Handler.
+func (o *Outbound) SenderSettings() *serial.TypedMessage {
+	return nil
+}
+
+// ProxySettings implements outbound.Handler.
+func (o *Outbound) ProxySettings() *serial.TypedMessage {
 	return nil
 }
 
@@ -133,6 +160,8 @@ func (p *StaticMuxPicker) cleanup() error {
 	for _, w := range p.workers {
 		if !w.Closed() {
 			activeWorkers = append(activeWorkers, w)
+		} else {
+			w.timer.SetTimeout(0)
 		}
 	}
 
@@ -148,7 +177,7 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 	defer p.access.Unlock()
 
 	if len(p.workers) == 0 {
-		return nil, newError("empty worker list")
+		return nil, errors.New("empty worker list")
 	}
 
 	var minIdx int = -1
@@ -157,7 +186,7 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 		if w.draining {
 			continue
 		}
-		if w.client.Closed() {
+		if w.IsFull() {
 			continue
 		}
 		if w.client.ActiveConnections() < minConn {
@@ -182,7 +211,7 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 		return p.workers[minIdx].client, nil
 	}
 
-	return nil, newError("no mux client worker available")
+	return nil, errors.New("no mux client worker available")
 }
 
 func (p *StaticMuxPicker) AddWorker(worker *PortalWorker) {
@@ -198,6 +227,8 @@ type PortalWorker struct {
 	writer   buf.Writer
 	reader   buf.Reader
 	draining bool
+	counter  uint32
+	timer    *signal.ActivityTimer
 }
 
 func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
@@ -206,20 +237,25 @@ func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
 	ctx := context.Background()
-	ctx = session.ContextWithOutbound(ctx, &session.Outbound{
+	outbounds := []*session.Outbound{{
 		Target: net.UDPDestination(net.DomainAddress(internalDomain), 0),
-	})
+	}}
+	ctx = session.ContextWithOutbounds(ctx, outbounds)
 	f := client.Dispatch(ctx, &transport.Link{
 		Reader: uplinkReader,
 		Writer: downlinkWriter,
 	})
 	if !f {
-		return nil, newError("unable to dispatch control connection")
+		return nil, errors.New("unable to dispatch control connection")
+	}
+	terminate := func() {
+		client.Close()
 	}
 	w := &PortalWorker{
 		client: client,
 		reader: downlinkReader,
 		writer: uplinkWriter,
+		timer:  signal.CancelAfterInactivity(ctx, terminate, 24*time.Hour), // // prevent leak
 	}
 	w.control = &task.Periodic{
 		Execute:  w.heartbeat,
@@ -230,12 +266,12 @@ func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
 }
 
 func (w *PortalWorker) heartbeat() error {
-	if w.client.Closed() {
-		return newError("client worker stopped")
+	if w.Closed() {
+		return errors.New("client worker stopped")
 	}
 
 	if w.draining || w.writer == nil {
-		return newError("already disposed")
+		return errors.New("already disposed")
 	}
 
 	msg := &Control{}
@@ -252,10 +288,15 @@ func (w *PortalWorker) heartbeat() error {
 		}()
 	}
 
-	b, err := proto.Marshal(msg)
-	common.Must(err)
-	mb := buf.MergeBytes(nil, b)
-	return w.writer.WriteMultiBuffer(mb)
+	w.counter = (w.counter + 1) % 5
+	if w.draining || w.counter == 1 {
+		b, err := proto.Marshal(msg)
+		common.Must(err)
+		mb := buf.MergeBytes(nil, b)
+		w.timer.Update()
+		return w.writer.WriteMultiBuffer(mb)
+	}
+	return nil
 }
 
 func (w *PortalWorker) IsFull() bool {

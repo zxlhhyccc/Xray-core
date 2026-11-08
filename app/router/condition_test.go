@@ -1,36 +1,22 @@
 package router_test
 
 import (
-	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	. "github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/platform"
-	"github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
-	"google.golang.org/protobuf/proto"
 )
-
-func init() {
-	wd, err := os.Getwd()
-	common.Must(err)
-
-	if _, err := os.Stat(platform.GetAssetLocation("geoip.dat")); err != nil && os.IsNotExist(err) {
-		common.Must(filesystem.CopyFile(platform.GetAssetLocation("geoip.dat"), filepath.Join(wd, "..", "..", "release", "config", "geoip.dat")))
-	}
-	if _, err := os.Stat(platform.GetAssetLocation("geosite.dat")); err != nil && os.IsNotExist(err) {
-		common.Must(filesystem.CopyFile(platform.GetAssetLocation("geosite.dat"), filepath.Join(wd, "..", "..", "release", "config", "geosite.dat")))
-	}
-}
 
 func withBackground() routing.Context {
 	return &routing_session.Context{}
@@ -60,18 +46,15 @@ func TestRoutingRule(t *testing.T) {
 	}{
 		{
 			rule: &RoutingRule{
-				Domain: []*Domain{
+				Domain: []*geodata.DomainRule{
 					{
-						Value: "example.com",
-						Type:  Domain_Plain,
+						Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Substr, Value: "example.com"}},
 					},
 					{
-						Value: "google.com",
-						Type:  Domain_Domain,
+						Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "google.com"}},
 					},
 					{
-						Value: "^facebook\\.com$",
-						Type:  Domain_Regex,
+						Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Regex, Value: "^facebook\\.com$"}},
 					},
 				},
 			},
@@ -108,56 +91,25 @@ func TestRoutingRule(t *testing.T) {
 		},
 		{
 			rule: &RoutingRule{
-				Cidr: []*CIDR{
+				Ip: []*geodata.IPRule{
 					{
-						Ip:     []byte{8, 8, 8, 8},
-						Prefix: 32,
-					},
-					{
-						Ip:     []byte{8, 8, 8, 8},
-						Prefix: 32,
-					},
-					{
-						Ip:     net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334").IP(),
-						Prefix: 128,
-					},
-				},
-			},
-			test: []ruleTest{
-				{
-					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("8.8.8.8"), 80)}),
-					output: true,
-				},
-				{
-					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("8.8.4.4"), 80)}),
-					output: false,
-				},
-				{
-					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334"), 80)}),
-					output: true,
-				},
-				{
-					input:  withBackground(),
-					output: false,
-				},
-			},
-		},
-		{
-			rule: &RoutingRule{
-				Geoip: []*GeoIP{
-					{
-						Cidr: []*CIDR{
-							{
-								Ip:     []byte{8, 8, 8, 8},
-								Prefix: 32,
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 8}, Prefix: 32},
 							},
-							{
-								Ip:     []byte{8, 8, 8, 8},
-								Prefix: 32,
+						},
+					},
+					{
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 8}, Prefix: 32},
 							},
-							{
-								Ip:     net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334").IP(),
-								Prefix: 128,
+						},
+					},
+					{
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: net.ParseAddress("2001:0db8:85a3:0000:0000:8a2e:0370:7334").IP(), Prefix: 128},
 							},
 						},
 					},
@@ -184,10 +136,13 @@ func TestRoutingRule(t *testing.T) {
 		},
 		{
 			rule: &RoutingRule{
-				SourceCidr: []*CIDR{
+				SourceIp: []*geodata.IPRule{
 					{
-						Ip:     []byte{192, 168, 0, 0},
-						Prefix: 16,
+						Value: &geodata.IPRule_Custom{
+							Custom: &geodata.CIDRRule{
+								Cidr: &geodata.CIDR{Ip: []byte{192, 168, 0, 0}, Prefix: 16},
+							},
+						},
 					},
 				},
 			},
@@ -347,33 +302,12 @@ func TestRoutingRule(t *testing.T) {
 	}
 }
 
-func loadGeoSite(country string) ([]*Domain, error) {
-	geositeBytes, err := filesystem.ReadAsset("geosite.dat")
-	if err != nil {
-		return nil, err
-	}
-	var geositeList GeoSiteList
-	if err := proto.Unmarshal(geositeBytes, &geositeList); err != nil {
-		return nil, err
-	}
-
-	for _, site := range geositeList.Entry {
-		if site.CountryCode == country {
-			return site.Domain, nil
-		}
-	}
-
-	return nil, errors.New("country not found: " + country)
-}
-
 func TestChinaSites(t *testing.T) {
-	domains, err := loadGeoSite("CN")
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	rules, err := geodata.ParseDomainRules([]string{"geosite:cn"}, geodata.Domain_Substr)
 	common.Must(err)
 
-	matcher, err := NewDomainMatcher(domains)
-	common.Must(err)
-
-	acMatcher, err := NewMphMatcherGroup(domains)
+	matcher, err := NewDomainMatcher(rules)
 	common.Must(err)
 
 	type TestCase struct {
@@ -404,63 +338,44 @@ func TestChinaSites(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		r1 := matcher.ApplyDomain(testCase.Domain)
-		r2 := acMatcher.ApplyDomain(testCase.Domain)
-		if r1 != testCase.Output {
-			t.Error("DomainMatcher expected output ", testCase.Output, " for domain ", testCase.Domain, " but got ", r1)
-		} else if r2 != testCase.Output {
-			t.Error("ACDomainMatcher expected output ", testCase.Output, " for domain ", testCase.Domain, " but got ", r2)
+		r := matcher.ApplyDomain(testCase.Domain)
+		if r != testCase.Output {
+			t.Error("DomainMatcher expected output ", testCase.Output, " for domain ", testCase.Domain, " but got ", r)
+		}
+	}
+}
+
+func TestLocalOSRule(t *testing.T) {
+	otherOS := "plan9"
+	if runtime.GOOS == otherOS {
+		otherOS = "linux"
+	}
+
+	cases := []struct {
+		localOS []string
+		output  bool
+	}{
+		{localOS: []string{runtime.GOOS}, output: true},
+		{localOS: []string{otherOS}, output: false},
+		{localOS: []string{otherOS, runtime.GOOS}, output: true},
+		{localOS: []string{strings.ToUpper(runtime.GOOS)}, output: true},
+	}
+
+	for _, test := range cases {
+		cond, err := (&RoutingRule{LocalOs: test.localOS}).BuildCondition()
+		common.Must(err)
+		if got := cond.Apply(withBackground()); got != test.output {
+			t.Errorf("for localOS %v on %s: expected %v, got %v", test.localOS, runtime.GOOS, test.output, got)
 		}
 	}
 }
 
 func BenchmarkMphDomainMatcher(b *testing.B) {
-	domains, err := loadGeoSite("CN")
+	b.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	rules, err := geodata.ParseDomainRules([]string{"geosite:cn"}, geodata.Domain_Substr)
 	common.Must(err)
 
-	matcher, err := NewMphMatcherGroup(domains)
-	common.Must(err)
-
-	type TestCase struct {
-		Domain string
-		Output bool
-	}
-	testCases := []TestCase{
-		{
-			Domain: "163.com",
-			Output: true,
-		},
-		{
-			Domain: "163.com",
-			Output: true,
-		},
-		{
-			Domain: "164.com",
-			Output: false,
-		},
-		{
-			Domain: "164.com",
-			Output: false,
-		},
-	}
-
-	for i := 0; i < 1024; i++ {
-		testCases = append(testCases, TestCase{Domain: strconv.Itoa(i) + ".not-exists.com", Output: false})
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for _, testCase := range testCases {
-			_ = matcher.ApplyDomain(testCase.Domain)
-		}
-	}
-}
-
-func BenchmarkDomainMatcher(b *testing.B) {
-	domains, err := loadGeoSite("CN")
-	common.Must(err)
-
-	matcher, err := NewDomainMatcher(domains)
+	matcher, err := NewDomainMatcher(rules)
 	common.Must(err)
 
 	type TestCase struct {
@@ -499,45 +414,11 @@ func BenchmarkDomainMatcher(b *testing.B) {
 }
 
 func BenchmarkMultiGeoIPMatcher(b *testing.B) {
-	var geoips []*GeoIP
+	b.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+	rules, err := geodata.ParseIPRules([]string{"geoip:cn", "geoip:ir", "geoip:ru"})
+	common.Must(err)
 
-	{
-		ips, err := loadGeoIP("CN")
-		common.Must(err)
-		geoips = append(geoips, &GeoIP{
-			CountryCode: "CN",
-			Cidr:        ips,
-		})
-	}
-
-	{
-		ips, err := loadGeoIP("JP")
-		common.Must(err)
-		geoips = append(geoips, &GeoIP{
-			CountryCode: "JP",
-			Cidr:        ips,
-		})
-	}
-
-	{
-		ips, err := loadGeoIP("CA")
-		common.Must(err)
-		geoips = append(geoips, &GeoIP{
-			CountryCode: "CA",
-			Cidr:        ips,
-		})
-	}
-
-	{
-		ips, err := loadGeoIP("US")
-		common.Must(err)
-		geoips = append(geoips, &GeoIP{
-			CountryCode: "US",
-			Cidr:        ips,
-		})
-	}
-
-	matcher, err := NewMultiGeoIPMatcher(geoips, false)
+	matcher, err := NewIPMatcher(rules, MatcherAsType_Target)
 	common.Must(err)
 
 	ctx := withOutbound(&session.Outbound{Target: net.TCPDestination(net.ParseAddress("8.8.8.8"), 80)})

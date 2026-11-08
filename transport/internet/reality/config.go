@@ -1,12 +1,16 @@
 package reality
 
 import (
+	"context"
+	"crypto/ecdh"
+	"crypto/mldsa"
 	"io"
 	"net"
 	"os"
 	"time"
 
 	"github.com/xtls/reality"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -20,7 +24,6 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 		Dest: c.Dest,
 		Xver: byte(c.Xver),
 
-		PrivateKey:   c.PrivateKey,
 		MinClientVer: c.MinClientVer,
 		MaxClientVer: c.MaxClientVer,
 		MaxTimeDiff:  time.Duration(c.MaxTimeDiff) * time.Millisecond,
@@ -29,6 +32,25 @@ func (c *Config) GetREALITYConfig() *reality.Config {
 		SessionTicketsDisabled: true,
 
 		KeyLogWriter: KeyLogWriterFromConfig(c),
+	}
+	var err error
+	if config.PrivateKey, err = ecdh.X25519().NewPrivateKey(c.PrivateKey); err != nil {
+		panic(err)
+	}
+	if c.Mldsa65Seed != nil {
+		if config.Mldsa65Key, err = mldsa.NewPrivateKey(mldsa.MLDSA65(), c.Mldsa65Seed); err != nil {
+			panic(err)
+		}
+	}
+	if c.LimitFallbackUpload != nil {
+		config.LimitFallbackUpload.AfterBytes = c.LimitFallbackUpload.AfterBytes
+		config.LimitFallbackUpload.BytesPerSec = c.LimitFallbackUpload.BytesPerSec
+		config.LimitFallbackUpload.BurstBytesPerSec = c.LimitFallbackUpload.BurstBytesPerSec
+	}
+	if c.LimitFallbackDownload != nil {
+		config.LimitFallbackDownload.AfterBytes = c.LimitFallbackDownload.AfterBytes
+		config.LimitFallbackDownload.BytesPerSec = c.LimitFallbackDownload.BytesPerSec
+		config.LimitFallbackDownload.BurstBytesPerSec = c.LimitFallbackDownload.BurstBytesPerSec
 	}
 	config.ServerNames = make(map[string]bool)
 	for _, serverName := range c.ServerNames {
@@ -46,9 +68,9 @@ func KeyLogWriterFromConfig(c *Config) io.Writer {
 		return nil
 	}
 
-	writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	writer, err := os.OpenFile(c.MasterKeyLog, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
-		newError("failed to open ", c.MasterKeyLog, " as master key log").AtError().Base(err).WriteToLog()
+		errors.LogErrorInner(context.Background(), err, "failed to open ", c.MasterKeyLog, " as master key log")
 	}
 
 	return writer

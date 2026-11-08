@@ -3,7 +3,10 @@ package command
 import (
 	"context"
 
+	"github.com/xtls/xray-core/app/commander"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/outbound"
@@ -26,7 +29,7 @@ type OutboundOperation interface {
 func getInbound(handler inbound.Handler) (proxy.Inbound, error) {
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
-		return nil, newError("can't get inbound proxy from handler.")
+		return nil, errors.New("can't get inbound proxy from handler.")
 	}
 	return gi.GetInbound(), nil
 }
@@ -39,11 +42,11 @@ func (op *AddUserOperation) ApplyInbound(ctx context.Context, handler inbound.Ha
 	}
 	um, ok := p.(proxy.UserManager)
 	if !ok {
-		return newError("proxy is not a UserManager")
+		return errors.New("proxy is not a UserManager")
 	}
 	mUser, err := op.User.ToMemoryUser()
 	if err != nil {
-		return newError("failed to parse user").Base(err)
+		return errors.New("failed to parse user").Base(err)
 	}
 	return um.AddUser(ctx, mUser)
 }
@@ -56,7 +59,7 @@ func (op *RemoveUserOperation) ApplyInbound(ctx context.Context, handler inbound
 	}
 	um, ok := p.(proxy.UserManager)
 	if !ok {
-		return newError("proxy is not a UserManager")
+		return errors.New("proxy is not a UserManager")
 	}
 	return um.RemoveUser(ctx, op.Email)
 }
@@ -82,19 +85,81 @@ func (s *handlerServer) RemoveInbound(ctx context.Context, request *RemoveInboun
 func (s *handlerServer) AlterInbound(ctx context.Context, request *AlterInboundRequest) (*AlterInboundResponse, error) {
 	rawOperation, err := request.Operation.GetInstance()
 	if err != nil {
-		return nil, newError("unknown operation").Base(err)
+		return nil, errors.New("unknown operation").Base(err)
 	}
 	operation, ok := rawOperation.(InboundOperation)
 	if !ok {
-		return nil, newError("not an inbound operation")
+		return nil, errors.New("not an inbound operation")
 	}
 
 	handler, err := s.ihm.GetHandler(ctx, request.Tag)
 	if err != nil {
-		return nil, newError("failed to get handler: ", request.Tag).Base(err)
+		return nil, errors.New("failed to get handler: ", request.Tag).Base(err)
 	}
 
 	return &AlterInboundResponse{}, operation.ApplyInbound(ctx, handler)
+}
+
+func (s *handlerServer) ListInbounds(ctx context.Context, request *ListInboundsRequest) (*ListInboundsResponse, error) {
+	handlers := s.ihm.ListHandlers(ctx)
+	response := &ListInboundsResponse{}
+	if request.GetIsOnlyTags() {
+		for _, handler := range handlers {
+			response.Inbounds = append(response.Inbounds, &core.InboundHandlerConfig{
+				Tag: handler.Tag(),
+			})
+		}
+	} else {
+		for _, handler := range handlers {
+			response.Inbounds = append(response.Inbounds, &core.InboundHandlerConfig{
+				Tag:              handler.Tag(),
+				ReceiverSettings: handler.ReceiverSettings(),
+				ProxySettings:    handler.ProxySettings(),
+			})
+		}
+	}
+
+	return response, nil
+}
+
+func (s *handlerServer) GetInboundUsers(ctx context.Context, request *GetInboundUserRequest) (*GetInboundUserResponse, error) {
+	handler, err := s.ihm.GetHandler(ctx, request.Tag)
+	if err != nil {
+		return nil, errors.New("failed to get handler: ", request.Tag).Base(err)
+	}
+	p, err := getInbound(handler)
+	if err != nil {
+		return nil, err
+	}
+	um, ok := p.(proxy.UserManager)
+	if !ok {
+		return nil, errors.New("proxy is not a UserManager")
+	}
+	if len(request.Email) > 0 {
+		return &GetInboundUserResponse{Users: []*protocol.User{protocol.ToProtoUser(um.GetUser(ctx, request.Email))}}, nil
+	}
+	result := make([]*protocol.User, 0, 100)
+	users := um.GetUsers(ctx)
+	for _, u := range users {
+		result = append(result, protocol.ToProtoUser(u))
+	}
+	return &GetInboundUserResponse{Users: result}, nil
+}
+
+func (s *handlerServer) GetInboundUsersCount(ctx context.Context, request *GetInboundUserRequest) (*GetInboundUsersCountResponse, error) {
+	handler, err := s.ihm.GetHandler(ctx, request.Tag)
+	if err != nil {
+		return nil, errors.New("failed to get handler: ", request.Tag).Base(err)
+	}
+	p, err := getInbound(handler)
+	if err != nil {
+		return nil, err
+	}
+	um, ok := p.(proxy.UserManager)
+	if !ok {
+		return nil, errors.New("proxy is not a UserManager")
+	}
+	return &GetInboundUsersCountResponse{Count: um.GetUsersCount(ctx)}, nil
 }
 
 func (s *handlerServer) AddOutbound(ctx context.Context, request *AddOutboundRequest) (*AddOutboundResponse, error) {
@@ -111,15 +176,32 @@ func (s *handlerServer) RemoveOutbound(ctx context.Context, request *RemoveOutbo
 func (s *handlerServer) AlterOutbound(ctx context.Context, request *AlterOutboundRequest) (*AlterOutboundResponse, error) {
 	rawOperation, err := request.Operation.GetInstance()
 	if err != nil {
-		return nil, newError("unknown operation").Base(err)
+		return nil, errors.New("unknown operation").Base(err)
 	}
 	operation, ok := rawOperation.(OutboundOperation)
 	if !ok {
-		return nil, newError("not an outbound operation")
+		return nil, errors.New("not an outbound operation")
 	}
 
 	handler := s.ohm.GetHandler(request.Tag)
 	return &AlterOutboundResponse{}, operation.ApplyOutbound(ctx, handler)
+}
+
+func (s *handlerServer) ListOutbounds(ctx context.Context, request *ListOutboundsRequest) (*ListOutboundsResponse, error) {
+	handlers := s.ohm.ListHandlers(ctx)
+	response := &ListOutboundsResponse{}
+	for _, handler := range handlers {
+		// Ignore gRPC outbound
+		if _, ok := handler.(*commander.Outbound); ok {
+			continue
+		}
+		response.Outbounds = append(response.Outbounds, &core.OutboundHandlerConfig{
+			Tag:            handler.Tag(),
+			SenderSettings: handler.SenderSettings(),
+			ProxySettings:  handler.ProxySettings(),
+		})
+	}
+	return response, nil
 }
 
 func (s *handlerServer) mustEmbedUnimplementedHandlerServiceServer() {}
@@ -135,7 +217,7 @@ func (s *service) Register(server *grpc.Server) {
 	common.Must(s.v.RequireFeatures(func(im inbound.Manager, om outbound.Manager) {
 		hs.ihm = im
 		hs.ohm = om
-	}))
+	}, false))
 	RegisterHandlerServiceServer(server, hs)
 
 	// For compatibility purposes

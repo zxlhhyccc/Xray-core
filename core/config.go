@@ -2,11 +2,13 @@ package core
 
 import (
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/cmdarg"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/main/confloader"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,14 +20,19 @@ type ConfigFormat struct {
 	Loader    ConfigLoader
 }
 
+type ConfigSource struct {
+	Name   string
+	Format string
+}
+
 // ConfigLoader is a utility to load Xray config from external source.
 type ConfigLoader func(input interface{}) (*Config, error)
 
 // ConfigBuilder is a builder to build core.Config from filenames and formats
-type ConfigBuilder func(files []string, formats []string) (*Config, error)
+type ConfigBuilder func(files []*ConfigSource) (*Config, error)
 
-// ConfigsMerger merge multiple json configs into on config
-type ConfigsMerger func(files []string, formats []string) (string, error)
+// ConfigsMerger merges multiple json configs into a single one
+type ConfigsMerger func(files []*ConfigSource) (string, error)
 
 var (
 	configLoaderByName    = make(map[string]*ConfigFormat)
@@ -38,14 +45,14 @@ var (
 func RegisterConfigLoader(format *ConfigFormat) error {
 	name := strings.ToLower(format.Name)
 	if _, found := configLoaderByName[name]; found {
-		return newError(format.Name, " already registered.")
+		return errors.New(format.Name, " already registered.")
 	}
 	configLoaderByName[name] = format
 
 	for _, ext := range format.Extension {
 		lext := strings.ToLower(ext)
 		if f, found := configLoaderByExt[lext]; found {
-			return newError(ext, " already registered to ", f.Name)
+			return errors.New(ext, " already registered to ", f.Name)
 		}
 		configLoaderByExt[lext] = format
 	}
@@ -54,20 +61,22 @@ func RegisterConfigLoader(format *ConfigFormat) error {
 }
 
 func GetMergedConfig(args cmdarg.Arg) (string, error) {
-	files := make([]string, 0)
-	formats := make([]string, 0)
+	var files []*ConfigSource
 	supported := []string{"json", "yaml", "toml"}
 	for _, file := range args {
-		format := getFormat(file)
-		for _, s := range supported {
-			if s == format {
-				files = append(files, file)
-				formats = append(formats, format)
-				break
-			}
+		format := "json"
+		if file != "stdin:" {
+			format = GetFormat(file)
+		}
+
+		if slices.Contains(supported, format) {
+			files = append(files, &ConfigSource{
+				Name:   file,
+				Format: format,
+			})
 		}
 	}
-	return ConfigMergedFormFiles(files, formats)
+	return ConfigMergedFormFiles(files)
 }
 
 func GetFormatByExtension(ext string) string {
@@ -93,21 +102,21 @@ func getExtension(filename string) string {
 	return filename[idx+1:]
 }
 
-func getFormat(filename string) string {
+func GetFormat(filename string) string {
 	return GetFormatByExtension(getExtension(filename))
 }
 
 func LoadConfig(formatName string, input interface{}) (*Config, error) {
 	switch v := input.(type) {
 	case cmdarg.Arg:
-		formats := make([]string, len(v))
+		files := make([]*ConfigSource, len(v))
 		hasProtobuf := false
 		for i, file := range v {
 			var f string
 
 			if formatName == "auto" {
 				if file != "stdin:" {
-					f = getFormat(file)
+					f = GetFormat(file)
 				} else {
 					f = "json"
 				}
@@ -116,13 +125,16 @@ func LoadConfig(formatName string, input interface{}) (*Config, error) {
 			}
 
 			if f == "" {
-				return nil, newError("Failed to get format of ", file).AtWarning()
+				return nil, errors.New("Failed to get format of ", file)
 			}
 
 			if f == "protobuf" {
 				hasProtobuf = true
 			}
-			formats[i] = f
+			files[i] = &ConfigSource{
+				Name:   file,
+				Format: f,
+			}
 		}
 
 		// only one protobuf config file is allowed
@@ -130,22 +142,21 @@ func LoadConfig(formatName string, input interface{}) (*Config, error) {
 			if len(v) == 1 {
 				return configLoaderByName["protobuf"].Loader(v)
 			} else {
-				return nil, newError("Only one protobuf config file is allowed").AtWarning()
+				return nil, errors.New("Only one protobuf config file is allowed")
 			}
 		}
 
 		// to avoid import cycle
-		return ConfigBuilderForFiles(v, formats)
-
+		return ConfigBuilderForFiles(files)
 	case io.Reader:
 		if f, found := configLoaderByName[formatName]; found {
 			return f.Loader(v)
 		} else {
-			return nil, newError("Unable to load config in", formatName).AtWarning()
+			return nil, errors.New("Unable to load config in", formatName)
 		}
 	}
 
-	return nil, newError("Unable to load config").AtWarning()
+	return nil, errors.New("Unable to load config")
 }
 
 func loadProtobufConfig(data []byte) (*Config, error) {
@@ -164,16 +175,20 @@ func init() {
 			switch v := input.(type) {
 			case cmdarg.Arg:
 				r, err := confloader.LoadConfig(v[0])
-				common.Must(err)
+				if err != nil {
+					return nil, err
+				}
 				data, err := buf.ReadAllToBytes(r)
-				common.Must(err)
+				if err != nil {
+					return nil, err
+				}
 				return loadProtobufConfig(data)
 			case io.Reader:
 				data, err := buf.ReadAllToBytes(v)
 				common.Must(err)
 				return loadProtobufConfig(data)
 			default:
-				return nil, newError("unknow type")
+				return nil, errors.New("unknown type")
 			}
 		},
 	}))

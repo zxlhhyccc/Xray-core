@@ -1,12 +1,26 @@
 package mux
 
 import (
+	"sync"
+
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
 )
+
+type MutexWriter struct {
+	sync.Mutex
+	buf.Writer
+}
+
+func (w *MutexWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.Lock()
+	defer w.Unlock()
+	return w.Writer.WriteMultiBuffer(mb)
+}
 
 type Writer struct {
 	dest         net.Destination
@@ -16,9 +30,10 @@ type Writer struct {
 	hasError     bool
 	transferType protocol.TransferType
 	globalID     [8]byte
+	inbound      *session.Inbound
 }
 
-func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte) *Writer {
+func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound) *Writer {
 	return &Writer{
 		id:           id,
 		dest:         dest,
@@ -26,6 +41,7 @@ func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType 
 		followup:     false,
 		transferType: transferType,
 		globalID:     globalID,
+		inbound:      inbound,
 	}
 }
 
@@ -43,6 +59,7 @@ func (w *Writer) getNextFrameMeta() FrameMetadata {
 		SessionID: w.id,
 		Target:    w.dest,
 		GlobalID:  w.globalID,
+		Inbound:   w.inbound,
 	}
 
 	if w.followup {

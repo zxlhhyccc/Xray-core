@@ -1,12 +1,14 @@
 package buf
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
 	"syscall"
 	"time"
 
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -18,11 +20,61 @@ type Reader interface {
 }
 
 // ErrReadTimeout is an error that happens with IO timeout.
-var ErrReadTimeout = newError("IO timeout")
+var ErrReadTimeout = errors.New("IO timeout")
 
 // TimeoutReader is a reader that returns error if Read() operation takes longer than the given timeout.
 type TimeoutReader interface {
+	Reader
 	ReadMultiBufferTimeout(time.Duration) (MultiBuffer, error)
+}
+
+type TimeoutWrapperReader struct {
+	Reader
+	stats.Counter
+	mb   MultiBuffer
+	err  error
+	done chan struct{}
+}
+
+func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
+	if r.done != nil {
+		<-r.done
+		r.done = nil
+		if r.Counter != nil {
+			r.Counter.Add(int64(r.mb.Len()))
+		}
+		return r.mb, r.err
+	}
+	r.mb, r.err = r.Reader.ReadMultiBuffer()
+	if r.Counter != nil {
+		r.Counter.Add(int64(r.mb.Len()))
+	}
+	return r.mb, r.err
+}
+
+func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
+	if r.done == nil {
+		r.done = make(chan struct{})
+		go func() {
+			r.mb, r.err = r.Reader.ReadMultiBuffer()
+			close(r.done)
+		}()
+	}
+	timeout := make(chan struct{})
+	go func() {
+		time.Sleep(duration)
+		close(timeout)
+	}()
+	select {
+	case <-r.done:
+		r.done = nil
+		if r.Counter != nil {
+			r.Counter.Add(int64(r.mb.Len()))
+		}
+		return r.mb, r.err
+	case <-timeout:
+		return nil, ErrReadTimeout
+	}
 }
 
 // Writer extends io.Writer with MultiBuffer.
@@ -70,11 +122,11 @@ func NewReader(reader io.Reader) Reader {
 	}
 
 	_, isFile := reader.(*os.File)
-	if !isFile && useReadv {
+	if !isFile && useReadV() {
 		if sc, ok := reader.(syscall.Conn); ok {
 			rawConn, err := sc.SyscallConn()
 			if err != nil {
-				newError("failed to get sysconn").Base(err).WriteToLog()
+				errors.LogInfoInner(context.Background(), err, "failed to get sysconn")
 			} else {
 				var counter stats.Counter
 

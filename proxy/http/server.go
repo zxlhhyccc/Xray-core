@@ -2,6 +2,7 @@ package http
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
@@ -17,11 +18,12 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -45,9 +47,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 func (s *Server) policy() policy.Session {
 	config := s.config
 	p := s.policyManager.ForLevel(config.UserLevel)
-	if config.Timeout > 0 && config.UserLevel == 0 {
-		p.Timeouts.ConnectionIdle = time.Duration(config.Timeout) * time.Second
-	}
 	return p
 }
 
@@ -83,27 +82,40 @@ type readerOnly struct {
 }
 
 func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	return s.ProcessWithFirstbyte(ctx, network, conn, dispatcher)
+}
+
+// Firstbyte is for forwarded conn from SOCKS inbound
+// Because it needs first byte to choose protocol
+// We need to add it back
+// Other parts are the same as the process function
+func (s *Server) ProcessWithFirstbyte(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher, firstbyte ...byte) error {
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "http"
-	inbound.SetCanSpliceCopy(2)
+	inbound.CanSpliceCopy = 2
 	inbound.User = &protocol.MemoryUser{
 		Level: s.config.UserLevel,
 	}
-
-	reader := bufio.NewReaderSize(readerOnly{conn}, buf.Size)
+	if !proxy.IsRAWTransportWithoutSecurity(conn) {
+		inbound.CanSpliceCopy = 3
+	}
+	var reader *bufio.Reader
+	if len(firstbyte) > 0 {
+		readerWithoutFirstbyte := bufio.NewReaderSize(readerOnly{conn}, buf.Size)
+		multiReader := io.MultiReader(bytes.NewReader(firstbyte), readerWithoutFirstbyte)
+		reader = bufio.NewReaderSize(multiReader, buf.Size)
+	} else {
+		reader = bufio.NewReaderSize(readerOnly{conn}, buf.Size)
+	}
 
 Start:
 	if err := conn.SetReadDeadline(time.Now().Add(s.policy().Timeouts.Handshake)); err != nil {
-		newError("failed to set read deadline").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogInfoInner(ctx, err, "failed to set read deadline")
 	}
 
 	request, err := http.ReadRequest(reader)
 	if err != nil {
-		trace := newError("failed to read http request").Base(err)
-		if errors.Cause(err) != io.EOF && !isTimeout(errors.Cause(err)) {
-			trace.AtWarning()
-		}
-		return trace
+		return errors.New("failed to read http request").Base(err)
 	}
 
 	if len(s.config.Accounts) > 0 {
@@ -116,9 +128,9 @@ Start:
 		}
 	}
 
-	newError("request to Method [", request.Method, "] Host [", request.Host, "] with URL [", request.URL, "]").WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "request to Method [", request.Method, "] Host [", request.Host, "] with URL [", request.URL, "]")
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		newError("failed to clear read deadline").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogDebugInner(ctx, err, "failed to clear read deadline")
 	}
 
 	defaultPort := net.Port(80)
@@ -131,7 +143,7 @@ Start:
 	}
 	dest, err := http_proto.ParseHost(host, defaultPort)
 	if err != nil {
-		return newError("malformed proxy host: ", host).AtWarning().Base(err)
+		return errors.New("malformed proxy host: ", host).Base(err)
 	}
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -157,65 +169,37 @@ Start:
 	return err
 }
 
-func (s *Server) handleConnect(ctx context.Context, _ *http.Request, reader *bufio.Reader, conn stat.Connection, dest net.Destination, dispatcher routing.Dispatcher, inbound *session.Inbound) error {
+func (s *Server) handleConnect(ctx context.Context, _ *http.Request, buffer *bufio.Reader, conn stat.Connection, dest net.Destination, dispatcher routing.Dispatcher, inbound *session.Inbound) error {
 	_, err := conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 	if err != nil {
-		return newError("failed to write back OK response").Base(err)
+		return errors.New("failed to write back OK response").Base(err)
 	}
 
-	plcy := s.policy()
-	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
-
-	if inbound != nil {
-		inbound.Timer = timer
-	}
-
-	ctx = policy.ContextWithBufferPolicy(ctx, plcy.Buffer)
-	link, err := dispatcher.Dispatch(ctx, dest)
-	if err != nil {
-		return err
-	}
-
-	if reader.Buffered() > 0 {
-		payload, err := buf.ReadFrom(io.LimitReader(reader, int64(reader.Buffered())))
+	reader := buf.NewReader(conn)
+	if buffer.Buffered() > 0 {
+		payload, err := buf.ReadFrom(io.LimitReader(buffer, int64(buffer.Buffered())))
 		if err != nil {
 			return err
 		}
-		if err := link.Writer.WriteMultiBuffer(payload); err != nil {
-			return err
-		}
-		reader = nil
+		reader = &buf.BufferedReader{Reader: reader, Buffer: payload}
+		buffer = nil
 	}
 
-	requestDone := func() error {
-		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-
-		return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
+	if inbound.CanSpliceCopy == 2 {
+		inbound.CanSpliceCopy = 1
 	}
-
-	responseDone := func() error {
-		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-
-		v2writer := buf.NewWriter(conn)
-		if err := buf.Copy(link.Reader, v2writer, buf.UpdateActivity(timer)); err != nil {
-			return err
-		}
-
-		return nil
+	if err := dispatcher.DispatchLink(
+		ctx, dest, &transport.Link{
+			Reader: reader,
+			Writer: buf.NewWriter(conn),
+		},
+	); err != nil {
+		return errors.New("failed to dispatch request").Base(err)
 	}
-
-	closeWriter := task.OnSuccess(requestDone, task.Close(link.Writer))
-	if err := task.Run(ctx, closeWriter, responseDone); err != nil {
-		common.Interrupt(link.Reader)
-		common.Interrupt(link.Writer)
-		return newError("connection ends").Base(err)
-	}
-
 	return nil
 }
 
-var errWaitAnother = newError("keep alive")
+var errWaitAnother = errors.New("keep alive")
 
 func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, writer io.Writer, dest net.Destination, dispatcher routing.Dispatcher) error {
 	if !s.config.AllowTransparent && request.URL.Host == "" {
@@ -274,20 +258,20 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		requestWriter := buf.NewBufferedWriter(link.Writer)
 		common.Must(requestWriter.SetBuffered(false))
 		if err := request.Write(requestWriter); err != nil {
-			return newError("failed to write whole request").Base(err).AtWarning()
+			return errors.New("failed to write whole request").Base(err)
 		}
 		return nil
 	}
 
 	responseDone := func() error {
 		responseReader := bufio.NewReaderSize(&buf.BufferedReader{Reader: link.Reader}, buf.Size)
-		response, err := http.ReadResponse(responseReader, request)
+		response, err := readResponseAndHandle100Continue(responseReader, request, writer)
 		if err == nil {
 			http_proto.RemoveHopByHopHeaders(response.Header)
 			if response.ContentLength >= 0 {
 				response.Header.Set("Proxy-Connection", "keep-alive")
 				response.Header.Set("Connection", "keep-alive")
-				response.Header.Set("Keep-Alive", "timeout=4")
+				response.Header.Set("Keep-Alive", "timeout=60")
 				response.Close = false
 			} else {
 				response.Close = true
@@ -295,7 +279,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			}
 			defer response.Body.Close()
 		} else {
-			newError("failed to read response from ", request.Host).Base(err).AtWarning().WriteToLog(session.ExportIDToError(ctx))
+			errors.LogWarningInner(ctx, err, "failed to read response from ", request.Host)
 			response = &http.Response{
 				Status:        "Service Unavailable",
 				StatusCode:    503,
@@ -311,7 +295,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			response.Header.Set("Proxy-Connection", "close")
 		}
 		if err := response.Write(writer); err != nil {
-			return newError("failed to write response").Base(err).AtWarning()
+			return errors.New("failed to write response").Base(err)
 		}
 		return nil
 	}
@@ -319,10 +303,43 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 	if err := task.Run(ctx, requestDone, responseDone); err != nil {
 		common.Interrupt(link.Reader)
 		common.Interrupt(link.Writer)
-		return newError("connection ends").Base(err)
+		return errors.New("connection ends").Base(err)
 	}
 
 	return result
+}
+
+// Sometimes, server might send 1xx response to client
+// it should not be processed by http proxy handler, just forward it to client
+func readResponseAndHandle100Continue(r *bufio.Reader, req *http.Request, writer io.Writer) (*http.Response, error) {
+	// Wait for the HTTP/1.x status prefix before inspecting the buffered response.
+	r.Peek(12)
+	peekBytes, err := r.Peek(min(56, r.Buffered()))
+	if err == nil || err == bufio.ErrBufferFull {
+		str := string(peekBytes)
+		ResponseLine := strings.Split(str, "\r\n")[0]
+		_, status, _ := strings.Cut(ResponseLine, " ")
+		// only handle 1xx response
+		if strings.HasPrefix(status, "1") {
+			ResponseHeader1xx := []byte{}
+			// read until \r\n\r\n (end of http response header)
+			for {
+				data, err := r.ReadSlice('\n')
+				if err != nil {
+					return nil, errors.New("failed to read http 1xx response").Base(err)
+				}
+				ResponseHeader1xx = append(ResponseHeader1xx, data...)
+				if len(ResponseHeader1xx) >= 4 && bytes.Equal(ResponseHeader1xx[len(ResponseHeader1xx)-4:], []byte{'\r', '\n', '\r', '\n'}) {
+					break
+				}
+				if len(ResponseHeader1xx) > 1024 {
+					return nil, errors.New("too big http 1xx response")
+				}
+			}
+			writer.Write(ResponseHeader1xx)
+		}
+	}
+	return http.ReadResponse(r, req)
 }
 
 func init() {

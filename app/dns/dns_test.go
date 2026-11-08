@@ -11,9 +11,9 @@ import (
 	"github.com/xtls/xray-core/app/policy"
 	"github.com/xtls/xray-core/app/proxyman"
 	_ "github.com/xtls/xray-core/app/proxyman/outbound"
-	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
@@ -76,6 +76,9 @@ func (*staticHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		case q.Name == "notexist.google.com." && q.Qtype == dns.TypeAAAA:
 			ans.MsgHdr.Rcode = dns.RcodeNameError
 
+		case q.Name == "notexist.google.com." && q.Qtype == dns.TypeA:
+			ans.MsgHdr.Rcode = dns.RcodeNameError
+
 		case q.Name == "hostname." && q.Qtype == dns.TypeA:
 			rr, _ := dns.NewRR("hostname. IN A 127.0.0.1")
 			ans.Answer = append(ans.Answer, rr)
@@ -117,22 +120,23 @@ func TestUDPServerSubnet(t *testing.T) {
 		Handler: &staticHandler{},
 		UDPSize: 1200,
 	}
-
 	go dnsServer.ListenAndServe()
 	time.Sleep(time.Second)
 
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
+				NameServer: []*NameServer{
 					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
 							},
+							Port: uint32(port),
 						},
-						Port: uint32(port),
 					},
 				},
 				ClientIp: []byte{7, 8, 9, 10},
@@ -143,7 +147,9 @@ func TestUDPServerSubnet(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -153,7 +159,7 @@ func TestUDPServerSubnet(t *testing.T) {
 
 	client := v.GetFeature(feature_dns.ClientType()).(feature_dns.Client)
 
-	ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+	ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 		IPv4Enable: true,
 		IPv6Enable: true,
 		FakeEnable: false,
@@ -183,15 +189,17 @@ func TestUDPServer(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
+				NameServer: []*NameServer{
 					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
 							},
+							Port: uint32(port),
 						},
-						Port: uint32(port),
 					},
 				},
 			}),
@@ -201,7 +209,9 @@ func TestUDPServer(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -212,7 +222,7 @@ func TestUDPServer(t *testing.T) {
 	client := v.GetFeature(feature_dns.ClientType()).(feature_dns.Client)
 
 	{
-		ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -227,7 +237,7 @@ func TestUDPServer(t *testing.T) {
 	}
 
 	{
-		ips, err := client.LookupIP("facebook.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("facebook.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -242,7 +252,7 @@ func TestUDPServer(t *testing.T) {
 	}
 
 	{
-		_, err := client.LookupIP("notexist.google.com", feature_dns.IPOption{
+		_, _, err := client.LookupIP("notexist.google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -256,7 +266,7 @@ func TestUDPServer(t *testing.T) {
 	}
 
 	{
-		ips, err := client.LookupIP("ipv4only.google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("ipv4only.google.com", feature_dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -272,7 +282,7 @@ func TestUDPServer(t *testing.T) {
 	dnsServer.Shutdown()
 
 	{
-		ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -303,18 +313,18 @@ func TestPrioritizedDomain(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
-					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
-							},
-						},
-						Port: 9999, /* unreachable */
-					},
-				},
 				NameServer: []*NameServer{
+					{
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
+							},
+							Port: 9999, /* unreachable */
+						},
+					},
 					{
 						Address: &net.Endpoint{
 							Network: net.Network_UDP,
@@ -325,10 +335,9 @@ func TestPrioritizedDomain(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
+						Domain: []*geodata.DomainRule{
 							{
-								Type:   DomainMatchingType_Full,
-								Domain: "google.com",
+								Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "google.com"}},
 							},
 						},
 					},
@@ -340,7 +349,9 @@ func TestPrioritizedDomain(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -353,7 +364,7 @@ func TestPrioritizedDomain(t *testing.T) {
 	startTime := time.Now()
 
 	{
-		ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -389,15 +400,17 @@ func TestUDPServerIPv6(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
+				NameServer: []*NameServer{
 					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
 							},
+							Port: uint32(port),
 						},
-						Port: uint32(port),
 					},
 				},
 			}),
@@ -407,7 +420,9 @@ func TestUDPServerIPv6(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -417,7 +432,7 @@ func TestUDPServerIPv6(t *testing.T) {
 
 	client := v.GetFeature(feature_dns.ClientType()).(feature_dns.Client)
 	{
-		ips, err := client.LookupIP("ipv6.google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("ipv6.google.com", feature_dns.IPOption{
 			IPv4Enable: false,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -448,21 +463,22 @@ func TestStaticHostDomain(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
+				NameServer: []*NameServer{
 					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
 							},
+							Port: uint32(port),
 						},
-						Port: uint32(port),
 					},
 				},
 				StaticHosts: []*Config_HostMapping{
 					{
-						Type:          DomainMatchingType_Full,
-						Domain:        "example.com",
+						Domain:        &geodata.DomainRule{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "example.com"}}},
 						ProxiedDomain: "google.com",
 					},
 				},
@@ -473,7 +489,9 @@ func TestStaticHostDomain(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -484,7 +502,7 @@ func TestStaticHostDomain(t *testing.T) {
 	client := v.GetFeature(feature_dns.ClientType()).(feature_dns.Client)
 
 	{
-		ips, err := client.LookupIP("example.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("example.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -529,17 +547,9 @@ func TestIPMatch(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						Geoip: []*router.GeoIP{
-							{
-								CountryCode: "local",
-								Cidr: []*router.CIDR{
-									{
-										// inner ip, will not match
-										Ip:     []byte{192, 168, 11, 1},
-										Prefix: 32,
-									},
-								},
-							},
+						ExpectedIp: []*geodata.IPRule{
+							// inner ip, will not match
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{192, 168, 11, 1}, Prefix: 32}}}},
 						},
 					},
 					// second dns, match ip
@@ -553,25 +563,9 @@ func TestIPMatch(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						Geoip: []*router.GeoIP{
-							{
-								CountryCode: "test",
-								Cidr: []*router.CIDR{
-									{
-										Ip:     []byte{8, 8, 8, 8},
-										Prefix: 32,
-									},
-								},
-							},
-							{
-								CountryCode: "test",
-								Cidr: []*router.CIDR{
-									{
-										Ip:     []byte{8, 8, 8, 4},
-										Prefix: 32,
-									},
-								},
-							},
+						ExpectedIp: []*geodata.IPRule{
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 8}, Prefix: 32}}}},
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 4}, Prefix: 32}}}},
 						},
 					},
 				},
@@ -582,7 +576,9 @@ func TestIPMatch(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -595,7 +591,7 @@ func TestIPMatch(t *testing.T) {
 	startTime := time.Now()
 
 	{
-		ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -631,17 +627,6 @@ func TestLocalDomain(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
-					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
-							},
-						},
-						Port: 9999, /* unreachable */
-					},
-				},
 				NameServer: []*NameServer{
 					{
 						Address: &net.Endpoint{
@@ -651,21 +636,7 @@ func TestLocalDomain(t *testing.T) {
 									Ip: []byte{127, 0, 0, 1},
 								},
 							},
-							Port: uint32(port),
-						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
-							// Equivalent of dotless:localhost
-							{Type: DomainMatchingType_Regex, Domain: "^[^.]*localhost[^.]*$"},
-						},
-						Geoip: []*router.GeoIP{
-							{ // Will match localhost, localhost-a and localhost-b,
-								CountryCode: "local",
-								Cidr: []*router.CIDR{
-									{Ip: []byte{127, 0, 0, 2}, Prefix: 32},
-									{Ip: []byte{127, 0, 0, 3}, Prefix: 32},
-									{Ip: []byte{127, 0, 0, 4}, Prefix: 32},
-								},
-							},
+							Port: 9999, /* unreachable */
 						},
 					},
 					{
@@ -678,23 +649,42 @@ func TestLocalDomain(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
+						Domain: []*geodata.DomainRule{
+							// Equivalent of dotless:localhost
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Regex, Value: "^[^.]*localhost[^.]*$"}}},
+						},
+						ExpectedIp: []*geodata.IPRule{
+							// Will match localhost, localhost-a and localhost-b,
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{127, 0, 0, 2}, Prefix: 32}}}},
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{127, 0, 0, 3}, Prefix: 32}}}},
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{127, 0, 0, 4}, Prefix: 32}}}},
+						},
+					},
+					{
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
+								},
+							},
+							Port: uint32(port),
+						},
+						Domain: []*geodata.DomainRule{
 							// Equivalent of dotless: and domain:local
-							{Type: DomainMatchingType_Regex, Domain: "^[^.]*$"},
-							{Type: DomainMatchingType_Subdomain, Domain: "local"},
-							{Type: DomainMatchingType_Subdomain, Domain: "localdomain"},
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Regex, Value: "^[^.]*$"}}},
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "local"}}},
+							{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "localdomain"}}},
 						},
 					},
 				},
 				StaticHosts: []*Config_HostMapping{
 					{
-						Type:   DomainMatchingType_Full,
-						Domain: "hostnamestatic",
+						Domain: &geodata.DomainRule{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "hostnamestatic"}}},
 						Ip:     [][]byte{{127, 0, 0, 53}},
 					},
 					{
-						Type:          DomainMatchingType_Full,
-						Domain:        "hostnamealias",
+						Domain:        &geodata.DomainRule{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "hostnamealias"}}},
 						ProxiedDomain: "hostname.localdomain",
 					},
 				},
@@ -705,7 +695,9 @@ func TestLocalDomain(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -718,7 +710,7 @@ func TestLocalDomain(t *testing.T) {
 	startTime := time.Now()
 
 	{ // Will match dotless:
-		ips, err := client.LookupIP("hostname", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("hostname", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -733,7 +725,7 @@ func TestLocalDomain(t *testing.T) {
 	}
 
 	{ // Will match domain:local
-		ips, err := client.LookupIP("hostname.local", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("hostname.local", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -748,7 +740,7 @@ func TestLocalDomain(t *testing.T) {
 	}
 
 	{ // Will match static ip
-		ips, err := client.LookupIP("hostnamestatic", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("hostnamestatic", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -763,7 +755,7 @@ func TestLocalDomain(t *testing.T) {
 	}
 
 	{ // Will match domain replacing
-		ips, err := client.LookupIP("hostnamealias", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("hostnamealias", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -777,8 +769,8 @@ func TestLocalDomain(t *testing.T) {
 		}
 	}
 
-	{ // Will match dotless:localhost, but not expectIPs: 127.0.0.2, 127.0.0.3, then matches at dotless:
-		ips, err := client.LookupIP("localhost", feature_dns.IPOption{
+	{ // Will match dotless:localhost, but not expectedIPs: 127.0.0.2, 127.0.0.3, then matches at dotless:
+		ips, _, err := client.LookupIP("localhost", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -792,8 +784,8 @@ func TestLocalDomain(t *testing.T) {
 		}
 	}
 
-	{ // Will match dotless:localhost, and expectIPs: 127.0.0.2, 127.0.0.3
-		ips, err := client.LookupIP("localhost-a", feature_dns.IPOption{
+	{ // Will match dotless:localhost, and expectedIPs: 127.0.0.2, 127.0.0.3
+		ips, _, err := client.LookupIP("localhost-a", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -807,8 +799,8 @@ func TestLocalDomain(t *testing.T) {
 		}
 	}
 
-	{ // Will match dotless:localhost, and expectIPs: 127.0.0.2, 127.0.0.3
-		ips, err := client.LookupIP("localhost-b", feature_dns.IPOption{
+	{ // Will match dotless:localhost, and expectedIPs: 127.0.0.2, 127.0.0.3
+		ips, _, err := client.LookupIP("localhost-b", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -823,7 +815,7 @@ func TestLocalDomain(t *testing.T) {
 	}
 
 	{ // Will match dotless:
-		ips, err := client.LookupIP("Mijia Cloud", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("Mijia Cloud", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -859,17 +851,6 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&Config{
-				NameServers: []*net.Endpoint{
-					{
-						Network: net.Network_UDP,
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
-							},
-						},
-						Port: 9999, /* unreachable */
-					},
-				},
 				NameServer: []*NameServer{
 					{
 						Address: &net.Endpoint{
@@ -879,21 +860,7 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 									Ip: []byte{127, 0, 0, 1},
 								},
 							},
-							Port: uint32(port),
-						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
-							{
-								Type:   DomainMatchingType_Subdomain,
-								Domain: "google.com",
-							},
-						},
-						Geoip: []*router.GeoIP{
-							{ // Will only match 8.8.8.8 and 8.8.4.4
-								Cidr: []*router.CIDR{
-									{Ip: []byte{8, 8, 8, 8}, Prefix: 32},
-									{Ip: []byte{8, 8, 4, 4}, Prefix: 32},
-								},
-							},
+							Port: 9999, /* unreachable */
 						},
 					},
 					{
@@ -906,18 +873,15 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
+						Domain: []*geodata.DomainRule{
 							{
-								Type:   DomainMatchingType_Subdomain,
-								Domain: "google.com",
+								Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "google.com"}},
 							},
 						},
-						Geoip: []*router.GeoIP{
-							{ // Will match 8.8.8.8 and 8.8.8.7, etc
-								Cidr: []*router.CIDR{
-									{Ip: []byte{8, 8, 8, 7}, Prefix: 24},
-								},
-							},
+						ExpectedIp: []*geodata.IPRule{
+							// Will only match 8.8.8.8 and 8.8.4.4
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 8}, Prefix: 32}}}},
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 4, 4}, Prefix: 32}}}},
 						},
 					},
 					{
@@ -930,18 +894,14 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
+						Domain: []*geodata.DomainRule{
 							{
-								Type:   DomainMatchingType_Subdomain,
-								Domain: "api.google.com",
+								Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "google.com"}},
 							},
 						},
-						Geoip: []*router.GeoIP{
-							{ // Will only match 8.8.7.7 (api.google.com)
-								Cidr: []*router.CIDR{
-									{Ip: []byte{8, 8, 7, 7}, Prefix: 32},
-								},
-							},
+						ExpectedIp: []*geodata.IPRule{
+							// Will match 8.8.8.8 and 8.8.8.7, etc
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 8, 7}, Prefix: 24}}}},
 						},
 					},
 					{
@@ -954,18 +914,34 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 							},
 							Port: uint32(port),
 						},
-						PrioritizedDomain: []*NameServer_PriorityDomain{
+						Domain: []*geodata.DomainRule{
 							{
-								Type:   DomainMatchingType_Full,
-								Domain: "v2.api.google.com",
+								Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "api.google.com"}},
 							},
 						},
-						Geoip: []*router.GeoIP{
-							{ // Will only match 8.8.7.8 (v2.api.google.com)
-								Cidr: []*router.CIDR{
-									{Ip: []byte{8, 8, 7, 8}, Prefix: 32},
+						ExpectedIp: []*geodata.IPRule{
+							// Will only match 8.8.7.7 (api.google.com)
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 7, 7}, Prefix: 32}}}},
+						},
+					},
+					{
+						Address: &net.Endpoint{
+							Network: net.Network_UDP,
+							Address: &net.IPOrDomain{
+								Address: &net.IPOrDomain_Ip{
+									Ip: []byte{127, 0, 0, 1},
 								},
 							},
+							Port: uint32(port),
+						},
+						Domain: []*geodata.DomainRule{
+							{
+								Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "v2.api.google.com"}},
+							},
+						},
+						ExpectedIp: []*geodata.IPRule{
+							// Will only match 8.8.7.8 (v2.api.google.com)
+							{Value: &geodata.IPRule_Custom{Custom: &geodata.CIDRRule{Cidr: &geodata.CIDR{Ip: []byte{8, 8, 7, 8}, Prefix: 32}}}},
 						},
 					},
 				},
@@ -976,7 +952,9 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
 			},
 		},
 	}
@@ -989,7 +967,7 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 	startTime := time.Now()
 
 	{ // Will match server 1,2 and server 1 returns expected ip
-		ips, err := client.LookupIP("google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -1004,7 +982,7 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 	}
 
 	{ // Will match server 1,2 and server 1 returns unexpected ip, then server 2 returns expected one
-		ips, err := client.LookupIP("ipv6.google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("ipv6.google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: false,
 			FakeEnable: false,
@@ -1019,7 +997,7 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 	}
 
 	{ // Will match server 3,1,2 and server 3 returns expected one
-		ips, err := client.LookupIP("api.google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("api.google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,
@@ -1034,7 +1012,7 @@ func TestMultiMatchPrioritizedDomain(t *testing.T) {
 	}
 
 	{ // Will match server 4,3,1,2 and server 4 returns expected one
-		ips, err := client.LookupIP("v2.api.google.com", feature_dns.IPOption{
+		ips, _, err := client.LookupIP("v2.api.google.com", feature_dns.IPOption{
 			IPv4Enable: true,
 			IPv6Enable: true,
 			FakeEnable: false,

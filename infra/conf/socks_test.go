@@ -27,7 +27,6 @@ func TestSocksInboundConfig(t *testing.T) {
 				],
 				"udp": false,
 				"ip": "127.0.0.1",
-				"timeout": 5,
 				"userLevel": 1
 			}`,
 			Parser: loadJSON(creator),
@@ -42,7 +41,6 @@ func TestSocksInboundConfig(t *testing.T) {
 						Ip: []byte{127, 0, 0, 1},
 					},
 				},
-				Timeout:   5,
 				UserLevel: 1,
 			},
 		},
@@ -67,23 +65,46 @@ func TestSocksOutboundConfig(t *testing.T) {
 			}`,
 			Parser: loadJSON(creator),
 			Output: &socks.ClientConfig{
-				Server: []*protocol.ServerEndpoint{
-					{
-						Address: &net.IPOrDomain{
-							Address: &net.IPOrDomain_Ip{
-								Ip: []byte{127, 0, 0, 1},
-							},
+				Server: &protocol.ServerEndpoint{
+					Address: &net.IPOrDomain{
+						Address: &net.IPOrDomain_Ip{
+							Ip: []byte{127, 0, 0, 1},
 						},
-						Port: 1234,
-						User: []*protocol.User{
-							{
-								Email: "test@email.com",
-								Account: serial.ToTypedMessage(&socks.Account{
-									Username: "test user",
-									Password: "test pass",
-								}),
-							},
+					},
+					Port: 1234,
+					User: &protocol.User{
+						Email: "test@email.com",
+						Account: serial.ToTypedMessage(&socks.Account{
+							Username: "test user",
+							Password: "test pass",
+						}),
+					},
+				},
+			},
+		},
+		{
+			Input: `{
+				"address": "127.0.0.1",
+				"port": 1234,
+				"user": "test user",
+				"pass": "test pass",
+				"email": "test@email.com"
+			}`,
+			Parser: loadJSON(creator),
+			Output: &socks.ClientConfig{
+				Server: &protocol.ServerEndpoint{
+					Address: &net.IPOrDomain{
+						Address: &net.IPOrDomain_Ip{
+							Ip: []byte{127, 0, 0, 1},
 						},
+					},
+					Port: 1234,
+					User: &protocol.User{
+						Email: "test@email.com",
+						Account: serial.ToTypedMessage(&socks.Account{
+							Username: "test user",
+							Password: "test pass",
+						}),
 					},
 				},
 			},

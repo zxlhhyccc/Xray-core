@@ -1,9 +1,8 @@
 package conf
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,27 +10,42 @@ import (
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/masque"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/vless/inbound"
+	"github.com/xtls/xray-core/proxy/vless/outbound"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
 	inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
+		"tunnel":        func() interface{} { return new(DokodemoConfig) },
 		"dokodemo-door": func() interface{} { return new(DokodemoConfig) },
 		"http":          func() interface{} { return new(HTTPServerConfig) },
 		"shadowsocks":   func() interface{} { return new(ShadowsocksServerConfig) },
+		"mixed":         func() interface{} { return new(SocksServerConfig) },
 		"socks":         func() interface{} { return new(SocksServerConfig) },
 		"vless":         func() interface{} { return new(VLessInboundConfig) },
 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
+		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
+		"masque":        func() interface{} { return new(MasqueServerConfig) },
+		"tun":           func() interface{} { return new(TunConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
+		"block":       func() interface{} { return new(BlackholeConfig) },
 		"blackhole":   func() interface{} { return new(BlackholeConfig) },
 		"loopback":    func() interface{} { return new(LoopbackConfig) },
+		"direct":      func() interface{} { return new(FreedomConfig) },
 		"freedom":     func() interface{} { return new(FreedomConfig) },
 		"http":        func() interface{} { return new(HTTPClientConfig) },
 		"shadowsocks": func() interface{} { return new(ShadowsocksClientConfig) },
@@ -39,69 +53,55 @@ var (
 		"vless":       func() interface{} { return new(VLessOutboundConfig) },
 		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
+		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
+		"masque":      func() interface{} { return new(MasqueClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
 	}, "protocol", "settings")
-
-	ctllog = log.New(os.Stderr, "xctl> ", 0)
 )
 
-func toProtocolList(s []string) ([]proxyman.KnownProtocols, error) {
-	kp := make([]proxyman.KnownProtocols, 0, 8)
-	for _, p := range s {
-		switch strings.ToLower(p) {
-		case "http":
-			kp = append(kp, proxyman.KnownProtocols_HTTP)
-		case "https", "tls", "ssl":
-			kp = append(kp, proxyman.KnownProtocols_TLS)
-		default:
-			return nil, newError("Unknown protocol: ", p)
-		}
-	}
-	return kp, nil
-}
-
 type SniffingConfig struct {
-	Enabled         bool        `json:"enabled"`
-	DestOverride    *StringList `json:"destOverride"`
-	DomainsExcluded *StringList `json:"domainsExcluded"`
-	MetadataOnly    bool        `json:"metadataOnly"`
-	RouteOnly       bool        `json:"routeOnly"`
+	Enabled         bool       `json:"enabled"`
+	DestOverride    StringList `json:"destOverride"`
+	DomainsExcluded StringList `json:"domainsExcluded"`
+	IPsExcluded     StringList `json:"ipsExcluded"`
+	MetadataOnly    bool       `json:"metadataOnly"`
+	RouteOnly       bool       `json:"routeOnly"`
 }
 
 // Build implements Buildable.
 func (c *SniffingConfig) Build() (*proxyman.SniffingConfig, error) {
-	var p []string
-	if c.DestOverride != nil {
-		for _, protocol := range *c.DestOverride {
-			switch strings.ToLower(protocol) {
-			case "http":
-				p = append(p, "http")
-			case "tls", "https", "ssl":
-				p = append(p, "tls")
-			case "quic":
-				p = append(p, "quic")
-			case "fakedns":
-				p = append(p, "fakedns")
-			case "fakedns+others":
-				p = append(p, "fakedns+others")
-			default:
-				return nil, newError("unknown protocol: ", protocol)
-			}
+	var protocols []string
+	for _, protocol := range c.DestOverride {
+		switch strings.ToLower(protocol) {
+		case "http":
+			protocols = append(protocols, "http")
+		case "tls", "https", "ssl":
+			protocols = append(protocols, "tls")
+		case "quic":
+			protocols = append(protocols, "quic")
+		case "fakedns", "fakedns+others":
+			protocols = append(protocols, "fakedns")
+		default:
+			return nil, errors.New("unknown protocol: ", protocol)
 		}
 	}
 
-	var d []string
-	if c.DomainsExcluded != nil {
-		for _, domain := range *c.DomainsExcluded {
-			d = append(d, strings.ToLower(domain))
-		}
+	domains, err := geodata.ParseDomainRules(c.DomainsExcluded, geodata.Domain_Substr)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := geodata.ParseIPRules(c.IPsExcluded)
+	if err != nil {
+		return nil, err
 	}
 
 	return &proxyman.SniffingConfig{
 		Enabled:             c.Enabled,
-		DestinationOverride: p,
-		DomainsExcluded:     d,
+		DestinationOverride: protocols,
+		DomainsExcluded:     domains,
+		IpsExcluded:         ips,
 		MetadataOnly:        c.MetadataOnly,
 		RouteOnly:           c.RouteOnly,
 	}, nil
@@ -121,7 +121,7 @@ func (m *MuxConfig) Build() (*proxyman.MultiplexingConfig, error) {
 		m.XudpProxyUDP443 = "reject"
 	case "reject", "allow", "skip":
 	default:
-		return nil, newError(`unknown "xudpProxyUDP443": `, m.XudpProxyUDP443)
+		return nil, errors.New(`unknown "xudpProxyUDP443": `, m.XudpProxyUDP443)
 	}
 	return &proxyman.MultiplexingConfig{
 		Enabled:         m.Enabled,
@@ -131,60 +131,27 @@ func (m *MuxConfig) Build() (*proxyman.MultiplexingConfig, error) {
 	}, nil
 }
 
-type InboundDetourAllocationConfig struct {
-	Strategy    string  `json:"strategy"`
-	Concurrency *uint32 `json:"concurrency"`
-	RefreshMin  *uint32 `json:"refresh"`
-}
-
-// Build implements Buildable.
-func (c *InboundDetourAllocationConfig) Build() (*proxyman.AllocationStrategy, error) {
-	config := new(proxyman.AllocationStrategy)
-	switch strings.ToLower(c.Strategy) {
-	case "always":
-		config.Type = proxyman.AllocationStrategy_Always
-	case "random":
-		config.Type = proxyman.AllocationStrategy_Random
-	case "external":
-		config.Type = proxyman.AllocationStrategy_External
-	default:
-		return nil, newError("unknown allocation strategy: ", c.Strategy)
-	}
-	if c.Concurrency != nil {
-		config.Concurrency = &proxyman.AllocationStrategy_AllocationStrategyConcurrency{
-			Value: *c.Concurrency,
-		}
-	}
-
-	if c.RefreshMin != nil {
-		config.Refresh = &proxyman.AllocationStrategy_AllocationStrategyRefresh{
-			Value: *c.RefreshMin,
-		}
-	}
-
-	return config, nil
-}
-
 type InboundDetourConfig struct {
-	Protocol       string                         `json:"protocol"`
-	PortList       *PortList                      `json:"port"`
-	ListenOn       *Address                       `json:"listen"`
-	Settings       *json.RawMessage               `json:"settings"`
-	Tag            string                         `json:"tag"`
-	Allocation     *InboundDetourAllocationConfig `json:"allocate"`
-	StreamSetting  *StreamConfig                  `json:"streamSettings"`
-	DomainOverride *StringList                    `json:"domainOverride"`
-	SniffingConfig *SniffingConfig                `json:"sniffing"`
+	Protocol       string           `json:"protocol"`
+	PortList       *PortList        `json:"port"`
+	ListenOn       *Address         `json:"listen"`
+	Settings       *json.RawMessage `json:"settings"`
+	Tag            string           `json:"tag"`
+	StreamSetting  *StreamConfig    `json:"streamSettings"`
+	SniffingConfig *SniffingConfig  `json:"sniffing"`
 }
 
 // Build implements Buildable.
 func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	receiverSettings := &proxyman.ReceiverConfig{}
 
-	if c.ListenOn == nil {
+	// TUN inbound doesn't need port configuration as it uses network interface instead
+	if strings.ToLower(c.Protocol) == "tun" {
+		// Skip port validation for TUN
+	} else if c.ListenOn == nil || len(c.ListenOn.String()) == 0 {
 		// Listen on anyip, must set PortList
 		if c.PortList == nil {
-			return nil, newError("Listen on AnyIP but no Port(s) set in InboundDetour.")
+			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
 		}
 		receiverSettings.PortList = c.PortList.Build()
 	} else {
@@ -195,7 +162,7 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 		if listenIP {
 			// Listen on specific IP, must set PortList
 			if c.PortList == nil {
-				return nil, newError("Listen on specific ip without port in InboundDetour.")
+				return nil, errors.New("Listen on specific ip without port in InboundDetour.")
 			}
 			// Listen on IP:Port
 			receiverSettings.PortList = c.PortList.Build()
@@ -205,54 +172,27 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 				receiverSettings.PortList = nil
 			}
 		} else {
-			return nil, newError("unable to listen on domain address: ", c.ListenOn.Domain())
+			return nil, errors.New("unable to listen on domain address: ", c.ListenOn.Domain())
 		}
 	}
 
-	if c.Allocation != nil {
-		concurrency := -1
-		if c.Allocation.Concurrency != nil && c.Allocation.Strategy == "random" {
-			concurrency = int(*c.Allocation.Concurrency)
-		}
-		portRange := 0
-
-		for _, pr := range c.PortList.Range {
-			portRange += int(pr.To - pr.From + 1)
-		}
-		if concurrency >= 0 && concurrency >= portRange {
-			var ports strings.Builder
-			for _, pr := range c.PortList.Range {
-				fmt.Fprintf(&ports, "%d-%d ", pr.From, pr.To)
-			}
-			return nil, newError("not enough ports. concurrency = ", concurrency, " ports: ", ports.String())
-		}
-
-		as, err := c.Allocation.Build()
-		if err != nil {
-			return nil, err
-		}
-		receiverSettings.AllocationStrategy = as
-	}
 	if c.StreamSetting != nil {
 		ss, err := c.StreamSetting.Build()
 		if err != nil {
 			return nil, err
 		}
 		receiverSettings.StreamSettings = ss
+		if strings.Contains(ss.SecurityType, "reality") && (receiverSettings.PortList == nil ||
+			len(receiverSettings.PortList.Ports()) != 1 || receiverSettings.PortList.Ports()[0] != 443) {
+			errors.LogWarning(context.Background(), `REALITY: Listening on non-443 ports will increase the likelihood of your server's IP being blocked by the GFW`)
+		}
 	}
 	if c.SniffingConfig != nil {
 		s, err := c.SniffingConfig.Build()
 		if err != nil {
-			return nil, newError("failed to build sniffing config").Base(err)
+			return nil, errors.New("failed to build sniffing config").Base(err)
 		}
 		receiverSettings.SniffingSettings = s
-	}
-	if c.DomainOverride != nil {
-		kp, err := toProtocolList(*c.DomainOverride)
-		if err != nil {
-			return nil, newError("failed to parse inbound detour config").Base(err)
-		}
-		receiverSettings.DomainOverride = kp
 	}
 
 	settings := []byte("{}")
@@ -261,13 +201,19 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	}
 	rawConfig, err := inboundConfigLoader.LoadWithID(settings, c.Protocol)
 	if err != nil {
-		return nil, newError("failed to load inbound detour config.").Base(err)
+		return nil, errors.New("failed to load inbound detour config for protocol ", c.Protocol).Base(err)
 	}
 	if dokodemoConfig, ok := rawConfig.(*DokodemoConfig); ok {
-		receiverSettings.ReceiveOriginalDestination = dokodemoConfig.Redirect
+		receiverSettings.ReceiveOriginalDestination = dokodemoConfig.FollowRedirect
 	}
 	ts, err := rawConfig.(Buildable).Build()
 	if err != nil {
+		return nil, errors.New("failed to build inbound handler for protocol ", c.Protocol).Base(err)
+	}
+	if _, ok := ts.(*masque.ServerConfig); !ok && receiverSettings.StreamSettings != nil && receiverSettings.StreamSettings.ProtocolName == "masque" {
+		return nil, errors.New("the masque transport can only be used by the masque inbound")
+	}
+	if err := validateXDrive(ts, receiverSettings.StreamSettings, nil, receiverSettings.PortList); err != nil {
 		return nil, err
 	}
 
@@ -279,40 +225,144 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 }
 
 type OutboundDetourConfig struct {
-	Protocol      string           `json:"protocol"`
-	SendThrough   *string          `json:"sendThrough"`
-	Tag           string           `json:"tag"`
-	Settings      *json.RawMessage `json:"settings"`
-	StreamSetting *StreamConfig    `json:"streamSettings"`
-	ProxySettings *ProxyConfig     `json:"proxySettings"`
-	MuxSettings   *MuxConfig       `json:"mux"`
+	Protocol       string           `json:"protocol"`
+	SendThrough    *string          `json:"sendThrough"`
+	Tag            string           `json:"tag"`
+	Settings       *json.RawMessage `json:"settings"`
+	StreamSetting  *StreamConfig    `json:"streamSettings"`
+	ProxySettings  *json.RawMessage `json:"proxySettings"`
+	MuxSettings    *MuxConfig       `json:"mux"`
+	TargetStrategy string           `json:"targetStrategy"`
 }
 
-func (c *OutboundDetourConfig) checkChainProxyConfig() error {
-	if c.StreamSetting == nil || c.ProxySettings == nil || c.StreamSetting.SocketSettings == nil {
+func requiresTransportSecurity(address *Address) bool {
+	if address == nil || address.Address == nil {
+		return true
+	}
+	if address.Family().IsIP() {
+		ip := address.IP()
+		return !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+	}
+	domain := strings.TrimSuffix(strings.ToLower(address.Domain()), ".")
+	return !geodata.GetPrivateDomainMatcher().MatchAny(domain)
+}
+
+func validateOutboundTransportSecurity(rawConfig interface{}, senderSettings *proxyman.SenderConfig) error {
+	if senderSettings.StreamSettings != nil && senderSettings.StreamSettings.GetSecurityType() != "" {
 		return nil
 	}
-	if len(c.ProxySettings.Tag) > 0 && len(c.StreamSetting.SocketSettings.DialerProxy) > 0 {
-		return newError("proxySettings.tag is conflicted with sockopt.dialerProxy").AtWarning()
+
+	if vlessCfg, ok := rawConfig.(*VLessOutboundConfig); ok {
+		if vlessCfg.Encryption != "" && vlessCfg.Encryption != "none" {
+			return nil
+		}
+		if requiresTransportSecurity(vlessCfg.Address) {
+			return errors.New("vless without TLS or other encryption is prohibited unless the server address is a private IP or domain")
+		}
+	}
+
+	if tjCfg, ok := rawConfig.(*TrojanClientConfig); ok {
+		if requiresTransportSecurity(tjCfg.Servers[0].Address) {
+			return errors.New("trojan without TLS is prohibited unless the server address is a private IP or domain")
+		}
+	}
+
+	return nil
+}
+
+// validateXDrive allows only VLESS with encryption on xdrive, and on the client Mux.Cool for every connection
+func validateXDrive(ts proto.Message, ss *internet.StreamConfig, ms *proxyman.MultiplexingConfig, pl *net.PortList) error {
+	if ss == nil || ss.ProtocolName != "xdrive" {
+		return nil
+	}
+	switch c := ts.(type) {
+	case *outbound.Config:
+		a, err := c.Vnext.User.Account.GetInstance()
+		if err != nil {
+			return err
+		}
+		account := a.(*vless.Account)
+		if account.Flow != "" {
+			return errors.New(`the xdrive transport doesn't support VLESS "flow"`)
+		}
+		if account.Encryption == "none" {
+			return errors.New(`the xdrive transport needs VLESS "encryption", run "xray vlessenc" to get one`)
+		}
+		// reverse opens its own mux
+		if account.Reverse == nil && (ms == nil || !ms.Enabled || ms.Concurrency < 0 || ms.XudpConcurrency < 0 || ms.XudpProxyUDP443 == "skip") {
+			return errors.New(`the xdrive transport needs "mux" enabled, with no negative "concurrency" or "xudpConcurrency" and no "xudpProxyUDP443":"skip"`)
+		}
+		if account.Testpre != 0 {
+			return errors.New(`the xdrive transport doesn't support VLESS "testpre"`)
+		}
+	case *inbound.Config:
+		if c.Decryption == "none" {
+			return errors.New(`the xdrive transport needs VLESS "decryption", run "xray vlessenc" to get one`)
+		}
+		for _, user := range c.Users {
+			a, err := user.Account.GetInstance()
+			if err != nil {
+				return err
+			}
+			if a.(*vless.Account).Flow != "" {
+				return errors.New(`the xdrive transport doesn't support VLESS "flow"`)
+			}
+		}
+		// every port gets its own listener on the same folder, and each of them accepts the same session
+		if pl != nil && len(pl.Ports()) != 1 {
+			return errors.New("the xdrive transport can only listen on one port")
+		}
+	default:
+		return errors.New("the xdrive transport can only be used by VLESS")
 	}
 	return nil
 }
 
 // Build implements Buildable.
 func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
+	if c.ProxySettings != nil {
+		return nil, errors.PrintRemovedFeatureError(`outbound "proxySettings"`, `"streamSettings.sockopt.dialerProxy"`)
+	}
+
 	senderSettings := &proxyman.SenderConfig{}
-	if err := c.checkChainProxyConfig(); err != nil {
-		return nil, err
+	switch strings.ToLower(c.TargetStrategy) {
+	case "asis", "":
+		senderSettings.TargetStrategy = internet.DomainStrategy_AS_IS
+	case "useip":
+		senderSettings.TargetStrategy = internet.DomainStrategy_USE_IP
+	case "useipv4":
+		senderSettings.TargetStrategy = internet.DomainStrategy_USE_IP4
+	case "useipv6":
+		senderSettings.TargetStrategy = internet.DomainStrategy_USE_IP6
+	case "useipv4v6":
+		senderSettings.TargetStrategy = internet.DomainStrategy_USE_IP46
+	case "useipv6v4":
+		senderSettings.TargetStrategy = internet.DomainStrategy_USE_IP64
+	case "forceip":
+		senderSettings.TargetStrategy = internet.DomainStrategy_FORCE_IP
+	case "forceipv4":
+		senderSettings.TargetStrategy = internet.DomainStrategy_FORCE_IP4
+	case "forceipv6":
+		senderSettings.TargetStrategy = internet.DomainStrategy_FORCE_IP6
+	case "forceipv4v6":
+		senderSettings.TargetStrategy = internet.DomainStrategy_FORCE_IP46
+	case "forceipv6v4":
+		senderSettings.TargetStrategy = internet.DomainStrategy_FORCE_IP64
+	default:
+		return nil, errors.New("unsupported target domain strategy: ", c.TargetStrategy)
 	}
 
 	if c.SendThrough != nil {
 		address := ParseSendThough(c.SendThrough)
-		//Check if CIDR exists
+		// Check if CIDR exists
 		if strings.Contains(*c.SendThrough, "/") {
 			senderSettings.ViaCidr = strings.Split(*c.SendThrough, "/")[1]
 		} else {
 			if address.Family().IsDomain() {
-				return nil, newError("unable to send through: " + address.String())
+				domain := address.Address.Domain()
+				if domain != "origin" && domain != "srcip" {
+					return nil, errors.New("unable to send through: " + address.String())
+				}
 			}
 		}
 		senderSettings.Via = address.Build()
@@ -321,35 +371,15 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	if c.StreamSetting != nil {
 		ss, err := c.StreamSetting.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build stream settings for outbound detour").Base(err)
 		}
 		senderSettings.StreamSettings = ss
-	}
-
-	if c.ProxySettings != nil {
-		ps, err := c.ProxySettings.Build()
-		if err != nil {
-			return nil, newError("invalid outbound detour proxy settings.").Base(err)
-		}
-		if ps.TransportLayerProxy {
-			if senderSettings.StreamSettings != nil {
-				if senderSettings.StreamSettings.SocketSettings != nil {
-					senderSettings.StreamSettings.SocketSettings.DialerProxy = ps.Tag
-				} else {
-					senderSettings.StreamSettings.SocketSettings = &internet.SocketConfig{DialerProxy: ps.Tag}
-				}
-			} else {
-				senderSettings.StreamSettings = &internet.StreamConfig{SocketSettings: &internet.SocketConfig{DialerProxy: ps.Tag}}
-			}
-			ps = nil
-		}
-		senderSettings.ProxySettings = ps
 	}
 
 	if c.MuxSettings != nil {
 		ms, err := c.MuxSettings.Build()
 		if err != nil {
-			return nil, newError("failed to build Mux config.").Base(err)
+			return nil, errors.New("failed to build Mux config").Base(err)
 		}
 		senderSettings.MultiplexSettings = ms
 	}
@@ -360,11 +390,46 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	}
 	rawConfig, err := outboundConfigLoader.LoadWithID(settings, c.Protocol)
 	if err != nil {
-		return nil, newError("failed to parse to outbound detour config.").Base(err)
+		return nil, errors.New("failed to load outbound detour config for protocol ", c.Protocol).Base(err)
 	}
 	ts, err := rawConfig.(Buildable).Build()
 	if err != nil {
+		return nil, errors.New("failed to build outbound handler for protocol ", c.Protocol).Base(err)
+	}
+	if err := validateXDrive(ts, senderSettings.StreamSettings, senderSettings.MultiplexSettings, nil); err != nil {
 		return nil, err
+	}
+	if err := validateOutboundTransportSecurity(rawConfig, senderSettings); err != nil {
+		return nil, err
+	}
+
+	if _, ok := ts.(*masque.ClientConfig); !ok && senderSettings.StreamSettings != nil && senderSettings.StreamSettings.ProtocolName == "masque" {
+		return nil, errors.New("the masque transport can only be used by the masque outbound")
+	}
+
+	if fc, ok := ts.(*freedom.Config); ok {
+		if senderSettings.StreamSettings != nil &&
+			senderSettings.StreamSettings.SocketSettings != nil &&
+			senderSettings.StreamSettings.SocketSettings.AddressPortStrategy != internet.AddressPortStrategy_None {
+			return nil, errors.New(`freedom outbound does not support "sockopt.addressPortStrategy"`)
+		}
+
+		var strategy internet.DomainStrategy
+		if strategy = senderSettings.TargetStrategy; strategy != internet.DomainStrategy_AS_IS {
+			errors.LogWarning(context.Background(), `The "outbound.targetStrategy" setting is not supported directly by freedom and has been automatically migrated to "sockopt.domainStrategy" with no behavior change.`)
+			senderSettings.TargetStrategy = internet.DomainStrategy_AS_IS
+		} else if strategy = fc.DomainStrategy; strategy != internet.DomainStrategy_AS_IS {
+			errors.LogWarning(context.Background(), `The "freedom.domainStrategy" setting is deprecated and will be removed. For compatibility, its value has been automatically migrated to "sockopt.domainStrategy". Please update your config before removal.`)
+		}
+		if strategy != internet.DomainStrategy_AS_IS {
+			if senderSettings.StreamSettings == nil {
+				senderSettings.StreamSettings = &internet.StreamConfig{}
+			}
+			if senderSettings.StreamSettings.SocketSettings == nil {
+				senderSettings.StreamSettings.SocketSettings = &internet.SocketConfig{}
+			}
+			senderSettings.StreamSettings.SocketSettings.DomainStrategy = strategy
+		}
 	}
 
 	return &core.OutboundHandlerConfig{
@@ -381,34 +446,25 @@ func (c *StatsConfig) Build() (*stats.Config, error) {
 	return &stats.Config{}, nil
 }
 
+type EnvConfig map[string]string
+
+func (c EnvConfig) Override(o EnvConfig) {
+	for key, value := range o {
+		c[key] = value
+	}
+}
+
 type Config struct {
-	// Port of this Point server.
-	// Deprecated: Port exists for historical compatibility
-	// and should not be used.
-	Port uint16 `json:"port"`
+	// Deprecated: Global transport config is no longer used
+	// left for returning error
+	Transport map[string]json.RawMessage `json:"transport"`
 
-	// Deprecated: InboundConfig exists for historical compatibility
-	// and should not be used.
-	InboundConfig *InboundDetourConfig `json:"inbound"`
-
-	// Deprecated: OutboundConfig exists for historical compatibility
-	// and should not be used.
-	OutboundConfig *OutboundDetourConfig `json:"outbound"`
-
-	// Deprecated: InboundDetours exists for historical compatibility
-	// and should not be used.
-	InboundDetours []InboundDetourConfig `json:"inboundDetour"`
-
-	// Deprecated: OutboundDetours exists for historical compatibility
-	// and should not be used.
-	OutboundDetours []OutboundDetourConfig `json:"outboundDetour"`
-
+	Env              EnvConfig               `json:"env"`
 	LogConfig        *LogConfig              `json:"log"`
 	RouterConfig     *RouterConfig           `json:"routing"`
 	DNSConfig        *DNSConfig              `json:"dns"`
 	InboundConfigs   []InboundDetourConfig   `json:"inbounds"`
 	OutboundConfigs  []OutboundDetourConfig  `json:"outbounds"`
-	Transport        *TransportConfig        `json:"transport"`
 	Policy           *PolicyConfig           `json:"policy"`
 	API              *APIConfig              `json:"api"`
 	Metrics          *MetricsConfig          `json:"metrics"`
@@ -417,6 +473,8 @@ type Config struct {
 	FakeDNS          *FakeDNSConfig          `json:"fakeDns"`
 	Observatory      *ObservatoryConfig      `json:"observatory"`
 	BurstObservatory *BurstObservatoryConfig `json:"burstObservatory"`
+	Version          *VersionConfig          `json:"version"`
+	Geodata          *GeodataConfig          `json:"geodata"`
 }
 
 func (c *Config) findInboundTag(tag string) int {
@@ -457,6 +515,12 @@ func (c *Config) Override(o *Config, fn string) {
 	if o.Transport != nil {
 		c.Transport = o.Transport
 	}
+	if o.Env != nil {
+		if c.Env == nil {
+			c.Env = EnvConfig{}
+		}
+		c.Env.Override(o.Env)
+	}
 	if o.Policy != nil {
 		c.Policy = o.Policy
 	}
@@ -485,33 +549,25 @@ func (c *Config) Override(o *Config, fn string) {
 		c.BurstObservatory = o.BurstObservatory
 	}
 
-	// deprecated attrs... keep them for now
-	if o.InboundConfig != nil {
-		c.InboundConfig = o.InboundConfig
+	if o.Version != nil {
+		c.Version = o.Version
 	}
-	if o.OutboundConfig != nil {
-		c.OutboundConfig = o.OutboundConfig
+
+	if o.Geodata != nil {
+		c.Geodata = o.Geodata
 	}
-	if o.InboundDetours != nil {
-		c.InboundDetours = o.InboundDetours
-	}
-	if o.OutboundDetours != nil {
-		c.OutboundDetours = o.OutboundDetours
-	}
-	// deprecated attrs
 
 	// update the Inbound in slice if the only one in override config has same tag
 	if len(o.InboundConfigs) > 0 {
 		for i := range o.InboundConfigs {
 			if idx := c.findInboundTag(o.InboundConfigs[i].Tag); idx > -1 {
 				c.InboundConfigs[idx] = o.InboundConfigs[i]
-				newError("[", fn, "] updated inbound with tag: ", o.InboundConfigs[i].Tag).AtInfo().WriteToLog()
+				errors.LogInfo(context.Background(), "[", fn, "] updated inbound with tag: ", o.InboundConfigs[i].Tag)
 
 			} else {
 				c.InboundConfigs = append(c.InboundConfigs, o.InboundConfigs[i])
-				newError("[", fn, "] appended inbound with tag: ", o.InboundConfigs[i].Tag).AtInfo().WriteToLog()
+				errors.LogInfo(context.Background(), "[", fn, "] appended inbound with tag: ", o.InboundConfigs[i].Tag)
 			}
-
 		}
 	}
 
@@ -521,14 +577,14 @@ func (c *Config) Override(o *Config, fn string) {
 		for i := range o.OutboundConfigs {
 			if idx := c.findOutboundTag(o.OutboundConfigs[i].Tag); idx > -1 {
 				c.OutboundConfigs[idx] = o.OutboundConfigs[i]
-				newError("[", fn, "] updated outbound with tag: ", o.OutboundConfigs[i].Tag).AtInfo().WriteToLog()
+				errors.LogInfo(context.Background(), "[", fn, "] updated outbound with tag: ", o.OutboundConfigs[i].Tag)
 			} else {
 				if strings.Contains(strings.ToLower(fn), "tail") {
 					c.OutboundConfigs = append(c.OutboundConfigs, o.OutboundConfigs[i])
-					newError("[", fn, "] appended outbound with tag: ", o.OutboundConfigs[i].Tag).AtInfo().WriteToLog()
+					errors.LogInfo(context.Background(), "[", fn, "] appended outbound with tag: ", o.OutboundConfigs[i].Tag)
 				} else {
 					outboundPrepends = append(outboundPrepends, o.OutboundConfigs[i])
-					newError("[", fn, "] prepend outbound with tag: ", o.OutboundConfigs[i].Tag).AtInfo().WriteToLog()
+					errors.LogInfo(context.Background(), "[", fn, "] prepend outbound with tag: ", o.OutboundConfigs[i].Tag)
 				}
 			}
 		}
@@ -538,37 +594,21 @@ func (c *Config) Override(o *Config, fn string) {
 	}
 }
 
-func applyTransportConfig(s *StreamConfig, t *TransportConfig) {
-	if s.TCPSettings == nil {
-		s.TCPSettings = t.TCPConfig
-	}
-	if s.KCPSettings == nil {
-		s.KCPSettings = t.KCPConfig
-	}
-	if s.WSSettings == nil {
-		s.WSSettings = t.WSConfig
-	}
-	if s.HTTPSettings == nil {
-		s.HTTPSettings = t.HTTPConfig
-	}
-	if s.DSSettings == nil {
-		s.DSSettings = t.DSConfig
-	}
-	if s.HTTPUPGRADESettings == nil {
-		s.HTTPUPGRADESettings = t.HTTPUPGRADEConfig
-	}
-}
-
 // Build implements Buildable.
 func (c *Config) Build() (*core.Config, error) {
+	for key, value := range c.Env {
+		if err := os.Setenv(key, value); err != nil {
+			return nil, errors.New("failed to apply environment configuration").Base(err)
+		}
+	}
+
 	if err := PostProcessConfigureFile(c); err != nil {
-		return nil, err
+		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}
 
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
-			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 		},
 	}
@@ -576,21 +616,21 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.API != nil {
 		apiConf, err := c.API.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build API configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(apiConf))
 	}
 	if c.Metrics != nil {
 		metricsConf, err := c.Metrics.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build metrics configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(metricsConf))
 	}
 	if c.Stats != nil {
 		statsConf, err := c.Stats.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build stats configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(statsConf))
 	}
@@ -608,7 +648,7 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.RouterConfig != nil {
 		routerConfig, err := c.RouterConfig.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build routing configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(routerConfig))
 	}
@@ -616,7 +656,7 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.DNSConfig != nil {
 		dnsApp, err := c.DNSConfig.Build()
 		if err != nil {
-			return nil, newError("failed to parse DNS config").Base(err)
+			return nil, errors.New("failed to build DNS configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(dnsApp))
 	}
@@ -624,15 +664,16 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.Policy != nil {
 		pc, err := c.Policy.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build policy configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(pc))
 	}
 
 	if c.Reverse != nil {
+		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
 		r, err := c.Reverse.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build reverse configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
@@ -640,7 +681,7 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.FakeDNS != nil {
 		r, err := c.FakeDNS.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build fake DNS configuration").Base(err)
 		}
 		config.App = append([]*serial.TypedMessage{serial.ToTypedMessage(r)}, config.App...)
 	}
@@ -648,7 +689,7 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.Observatory != nil {
 		r, err := c.Observatory.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build observatory configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
@@ -656,71 +697,58 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.BurstObservatory != nil {
 		r, err := c.BurstObservatory.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build burst observatory configuration").Base(err)
 		}
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
 
+	if c.Version != nil {
+		r, err := c.Version.Build()
+		if err != nil {
+			return nil, errors.New("failed to build version configuration").Base(err)
+		}
+		config.App = append(config.App, serial.ToTypedMessage(r))
+	}
+
+	if c.Geodata != nil {
+		r, err := c.Geodata.Build()
+		if err != nil {
+			return nil, errors.New("failed to build geodata configuration").Base(err)
+		}
+		config.App = append(config.App, serial.ToTypedMessage(r))
+	}
+
+	// Initialize the inbound module last to ensure inbound connections are handled correctly.
+	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))
+
 	var inbounds []InboundDetourConfig
-
-	if c.InboundConfig != nil {
-		inbounds = append(inbounds, *c.InboundConfig)
-	}
-
-	if len(c.InboundDetours) > 0 {
-		inbounds = append(inbounds, c.InboundDetours...)
-	}
 
 	if len(c.InboundConfigs) > 0 {
 		inbounds = append(inbounds, c.InboundConfigs...)
 	}
 
-	// Backward compatibility.
-	if len(inbounds) > 0 && inbounds[0].PortList == nil && c.Port > 0 {
-		inbounds[0].PortList = &PortList{[]PortRange{{
-			From: uint32(c.Port),
-			To:   uint32(c.Port),
-		}}}
+	if len(c.Transport) > 0 {
+		return nil, errors.PrintRemovedFeatureError("Global transport config", "streamSettings in inbounds and outbounds")
 	}
 
 	for _, rawInboundConfig := range inbounds {
-		if c.Transport != nil {
-			if rawInboundConfig.StreamSetting == nil {
-				rawInboundConfig.StreamSetting = &StreamConfig{}
-			}
-			applyTransportConfig(rawInboundConfig.StreamSetting, c.Transport)
-		}
 		ic, err := rawInboundConfig.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build inbound config with tag ", rawInboundConfig.Tag).Base(err)
 		}
 		config.Inbound = append(config.Inbound, ic)
 	}
 
 	var outbounds []OutboundDetourConfig
 
-	if c.OutboundConfig != nil {
-		outbounds = append(outbounds, *c.OutboundConfig)
-	}
-
-	if len(c.OutboundDetours) > 0 {
-		outbounds = append(outbounds, c.OutboundDetours...)
-	}
-
 	if len(c.OutboundConfigs) > 0 {
 		outbounds = append(outbounds, c.OutboundConfigs...)
 	}
 
 	for _, rawOutboundConfig := range outbounds {
-		if c.Transport != nil {
-			if rawOutboundConfig.StreamSetting == nil {
-				rawOutboundConfig.StreamSetting = &StreamConfig{}
-			}
-			applyTransportConfig(rawOutboundConfig.StreamSetting, c.Transport)
-		}
 		oc, err := rawOutboundConfig.Build()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to build outbound config with tag ", rawOutboundConfig.Tag).Base(err)
 		}
 		config.Outbound = append(config.Outbound, oc)
 	}

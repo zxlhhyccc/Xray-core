@@ -1,16 +1,16 @@
 package outbound
 
-//go:generate go run github.com/xtls/xray-core/common/errors/errorgen
-
 import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"hash/crc64"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
@@ -30,27 +30,24 @@ import (
 
 // Handler is an outbound connection handler for VMess protocol.
 type Handler struct {
-	serverList    *protocol.ServerList
-	serverPicker  protocol.ServerPicker
+	server        *protocol.ServerSpec
 	policyManager policy.Manager
 	cone          bool
 }
 
 // New creates a new VMess outbound handler.
 func New(ctx context.Context, config *Config) (*Handler, error) {
-	serverList := protocol.NewServerList()
-	for _, rec := range config.Receiver {
-		s, err := protocol.NewServerSpecFromPB(rec)
-		if err != nil {
-			return nil, newError("failed to parse server spec").Base(err)
-		}
-		serverList.AddServer(s)
+	if config.Receiver == nil {
+		return nil, errors.New(`no vnext found`)
+	}
+	server, err := protocol.NewServerSpecFromPB(config.Receiver)
+	if err != nil {
+		return nil, errors.New("failed to get server spec").Base(err)
 	}
 
 	v := core.MustFromContext(ctx)
 	handler := &Handler{
-		serverList:    serverList,
-		serverPicker:  protocol.NewRoundRobinServerPicker(serverList),
+		server:        server,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
 	}
@@ -60,21 +57,19 @@ func New(ctx context.Context, config *Config) (*Handler, error) {
 
 // Process implements proxy.Outbound.Process().
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
-	outbound := session.OutboundFromContext(ctx)
-	if outbound == nil || !outbound.Target.IsValid() {
-		return newError("target not specified").AtError()
+	outbounds := session.OutboundsFromContext(ctx)
+	ob := outbounds[len(outbounds)-1]
+	if !ob.Target.IsValid() {
+		return errors.New("target not specified")
 	}
-	outbound.Name = "vmess"
-	inbound := session.InboundFromContext(ctx)
-	if inbound != nil {
-		inbound.SetCanSpliceCopy(3)
-	}
+	ob.Name = "vmess"
+	ob.CanSpliceCopy = 3
 
-	var rec *protocol.ServerSpec
+	rec := h.server
 	var conn stat.Connection
+
 	err := retry.ExponentialBackoff(5, 200).On(func() error {
-		rec = h.serverPicker.PickServer()
-		rawConn, err := dialer.Dial(ctx, rec.Destination())
+		rawConn, err := dialer.Dial(ctx, rec.Destination)
 		if err != nil {
 			return err
 		}
@@ -83,12 +78,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return nil
 	})
 	if err != nil {
-		return newError("failed to find an available destination").Base(err).AtWarning()
+		return errors.New("failed to find an available destination").Base(err)
 	}
 	defer conn.Close()
 
-	target := outbound.Target
-	newError("tunneling request to ", target, " via ", rec.Destination().NetAddr()).WriteToLog(session.ExportIDToError(ctx))
+	target := ob.Target
+	errors.LogInfo(ctx, "tunneling request to ", target, " via ", rec.Destination.NetAddr())
 
 	command := protocol.RequestCommandTCP
 	if target.Network == net.Network_UDP {
@@ -98,7 +93,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		command = protocol.RequestCommandMux
 	}
 
-	user := rec.PickUser()
+	user := rec.User
 	request := &protocol.RequestHeader{
 		Version: encoding.Version,
 		User:    user,
@@ -111,18 +106,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	account := request.User.Account.(*vmess.MemoryAccount)
 	request.Security = account.Security
 
-	if request.Security == protocol.SecurityType_AES128_GCM || request.Security == protocol.SecurityType_NONE || request.Security == protocol.SecurityType_CHACHA20_POLY1305 {
+	if request.Security == protocol.SecurityType_AES128_GCM || request.Security == protocol.SecurityType_CHACHA20_POLY1305 {
 		request.Option.Set(protocol.RequestOptionChunkMasking)
 	}
 
 	if shouldEnablePadding(request.Security) && request.Option.Has(protocol.RequestOptionChunkMasking) {
 		request.Option.Set(protocol.RequestOptionGlobalPadding)
-	}
-
-	if request.Security == protocol.SecurityType_ZERO {
-		request.Security = protocol.SecurityType_NONE
-		request.Option.Clear(protocol.RequestOptionChunkStream)
-		request.Option.Clear(protocol.RequestOptionChunkMasking)
 	}
 
 	if account.AuthenticatedLengthExperiment {
@@ -165,19 +154,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		writer := buf.NewBufferedWriter(buf.NewWriter(conn))
 		if err := session.EncodeRequestHeader(request, writer); err != nil {
-			return newError("failed to encode request").Base(err).AtWarning()
+			return errors.New("failed to encode request").Base(err)
 		}
 
 		bodyWriter, err := session.EncodeRequestBody(request, writer)
 		if err != nil {
-			return newError("failed to start encoding").Base(err)
+			return errors.New("failed to start encoding").Base(err)
 		}
 		bodyWriter2 := bodyWriter
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			bodyWriter = xudp.NewPacketWriter(bodyWriter, target, xudp.GetGlobalID(ctx))
 		}
 		if err := buf.CopyOnceTimeout(input, bodyWriter, time.Millisecond*100); err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout {
-			return newError("failed to write first payload").Base(err)
+			return errors.New("failed to write first payload").Base(err)
 		}
 
 		if err := writer.SetBuffered(false); err != nil {
@@ -203,13 +192,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		reader := &buf.BufferedReader{Reader: buf.NewReader(conn)}
 		header, err := session.DecodeResponseHeader(reader)
 		if err != nil {
-			return newError("failed to read header").Base(err)
+			return errors.New("failed to read header").Base(err)
 		}
-		h.handleCommand(rec.Destination(), header.Command)
+		h.handleCommand(rec.Destination, header.Command)
 
 		bodyReader, err := session.DecodeResponseBody(request, reader)
 		if err != nil {
-			return newError("failed to start encoding response").Base(err)
+			return errors.New("failed to start encoding response").Base(err)
 		}
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			bodyReader = xudp.NewPacketReader(&buf.BufferedReader{Reader: bodyReader})
@@ -224,18 +213,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDonePost := task.OnSuccess(responseDone, task.Close(output))
 	if err := task.Run(ctx, requestDone, responseDonePost); err != nil {
-		return newError("connection ends").Base(err)
+		return errors.New("connection ends").Base(err)
 	}
 
 	return nil
 }
 
-var (
-	enablePadding = false
-)
+var enablePadding atomic.Bool
 
 func shouldEnablePadding(s protocol.SecurityType) bool {
-	return enablePadding || s == protocol.SecurityType_AES128_GCM || s == protocol.SecurityType_CHACHA20_POLY1305 || s == protocol.SecurityType_AUTO
+	return enablePadding.Load() || s == protocol.SecurityType_AES128_GCM || s == protocol.SecurityType_CHACHA20_POLY1305 || s == protocol.SecurityType_AUTO
+}
+
+func reloadEnvSettings() error {
+	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
+	paddingValue := platform.NewEnvFlag(platform.UseVmessPadding).GetValue(func() string { return defaultFlagValue })
+	enablePadding.Store(paddingValue != defaultFlagValue)
+	return nil
 }
 
 func init() {
@@ -243,10 +237,5 @@ func init() {
 		return New(ctx, config.(*Config))
 	}))
 
-	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
-
-	paddingValue := platform.NewEnvFlag(platform.UseVmessPadding).GetValue(func() string { return defaultFlagValue })
-	if paddingValue != defaultFlagValue {
-		enablePadding = true
-	}
+	platform.RegisterEnvReload(reloadEnvSettings)
 }

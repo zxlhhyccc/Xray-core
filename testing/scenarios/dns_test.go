@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
@@ -16,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/proxy/freedom"
 	"github.com/xtls/xray-core/proxy/socks"
 	"github.com/xtls/xray-core/testing/servers/tcp"
+	"github.com/xtls/xray-core/transport/internet"
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -31,18 +33,24 @@ func TestResolveIP(t *testing.T) {
 	serverConfig := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dns.Config{
-				Hosts: map[string]*net.IPOrDomain{
-					"google.com": net.NewIPOrDomain(dest.Address),
+				StaticHosts: []*dns.Config_HostMapping{
+					{
+						Domain: &geodata.DomainRule{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: "google.com"}}},
+						Ip:     [][]byte{dest.Address.IP()},
+					},
 				},
 			}),
 			serial.ToTypedMessage(&router.Config{
 				DomainStrategy: router.Config_IpIfNonMatch,
 				Rule: []*router.RoutingRule{
 					{
-						Cidr: []*router.CIDR{
+						Ip: []*geodata.IPRule{
 							{
-								Ip:     []byte{127, 0, 0, 0},
-								Prefix: 8,
+								Value: &geodata.IPRule_Custom{
+									Custom: &geodata.CIDRRule{
+										Cidr: &geodata.CIDR{Ip: []byte{127, 0, 0, 0}, Prefix: 8},
+									},
+								},
 							},
 						},
 						TargetTag: &router.RoutingRule_Tag{
@@ -74,9 +82,14 @@ func TestResolveIP(t *testing.T) {
 			},
 			{
 				Tag: "direct",
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					DomainStrategy: freedom.Config_USE_IP,
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
+					StreamSettings: &internet.StreamConfig{
+						SocketSettings: &internet.SocketConfig{
+							DomainStrategy: internet.DomainStrategy_USE_IP,
+						},
+					},
 				}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
 			},
 		},
 	}

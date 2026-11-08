@@ -2,8 +2,6 @@ package encoding
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
 	"hash/fnv"
@@ -16,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/drain"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/task"
@@ -75,7 +74,7 @@ func (h *SessionHistory) removeExpiredEntries() error {
 	defer h.Unlock()
 
 	if len(h.cache) == 0 {
-		return newError("nothing to do")
+		return errors.New("nothing to do")
 	}
 
 	for session, expire := range h.cache {
@@ -130,7 +129,7 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 
 	drainer, err := drain.NewBehaviorSeedLimitedDrainer(int64(s.userValidator.GetBehaviorSeed()), 16+38, 3266, 64)
 	if err != nil {
-		return nil, newError("failed to initialize drainer").Base(err)
+		return nil, errors.New("failed to initialize drainer").Base(err)
 	}
 
 	drainConnection := func(e error) error {
@@ -147,7 +146,7 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 	}()
 
 	if _, err := buffer.ReadFullFrom(reader, protocol.IDBytesLen); err != nil {
-		return nil, newError("failed to read request header").Base(err)
+		return nil, errors.New("failed to read request header").Base(err)
 	}
 
 	var decryptor io.Reader
@@ -167,20 +166,20 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 		if errorReason != nil {
 			if shouldDrain {
 				drainer.AcknowledgeReceive(bytesRead)
-				return nil, drainConnection(newError("AEAD read failed").Base(errorReason))
+				return nil, drainConnection(errors.New("AEAD read failed").Base(errorReason))
 			} else {
-				return nil, drainConnection(newError("AEAD read failed, drain skipped").Base(errorReason))
+				return nil, drainConnection(errors.New("AEAD read failed, drain skipped").Base(errorReason))
 			}
 		}
 		decryptor = bytes.NewReader(aeadData)
 	default:
-		return nil, drainConnection(newError("invalid user").Base(errorAEAD))
+		return nil, drainConnection(errors.New("invalid user").Base(errorAEAD))
 	}
 
 	drainer.AcknowledgeReceive(int(buffer.Len()))
 	buffer.Clear()
 	if _, err := buffer.ReadFullFrom(decryptor, 38); err != nil {
-		return nil, newError("failed to read request header").Base(err)
+		return nil, errors.New("failed to read request header").Base(err)
 	}
 
 	request := &protocol.RequestHeader{
@@ -195,7 +194,7 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 	sid.key = s.requestBodyKey
 	sid.nonce = s.requestBodyIV
 	if !s.sessionHistory.addIfNotExits(sid) {
-		return nil, newError("duplicated session id, possibly under replay attack, but this is a AEAD request")
+		return nil, errors.New("duplicated session id, possibly under replay attack, but this is a AEAD request")
 	}
 
 	s.responseHeader = buffer.Byte(33)             // 1 byte
@@ -219,12 +218,12 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 
 	if paddingLen > 0 {
 		if _, err := buffer.ReadFullFrom(decryptor, int32(paddingLen)); err != nil {
-			return nil, newError("failed to read padding").Base(err)
+			return nil, errors.New("failed to read padding").Base(err)
 		}
 	}
 
 	if _, err := buffer.ReadFullFrom(decryptor, 4); err != nil {
-		return nil, newError("failed to read checksum").Base(err)
+		return nil, errors.New("failed to read checksum").Base(err)
 	}
 
 	fnv1a := fnv.New32a()
@@ -233,15 +232,15 @@ func (s *ServerSession) DecodeRequestHeader(reader io.Reader, isDrain bool) (*pr
 	expectedHash := binary.BigEndian.Uint32(buffer.BytesFrom(-4))
 
 	if actualHash != expectedHash {
-		return nil, newError("invalid auth, but this is a AEAD request")
+		return nil, errors.New("invalid auth, but this is a AEAD request")
 	}
 
 	if request.Address == nil {
-		return nil, newError("invalid remote address")
+		return nil, errors.New("invalid remote address")
 	}
 
 	if request.Security == protocol.SecurityType_UNKNOWN || request.Security == protocol.SecurityType_AUTO {
-		return nil, newError("unknown security type: ", request.Security)
+		return nil, errors.New("unknown security type: ", request.Security)
 	}
 
 	return request, nil
@@ -258,26 +257,11 @@ func (s *ServerSession) DecodeRequestBody(request *protocol.RequestHeader, reade
 		var ok bool
 		padding, ok = sizeParser.(crypto.PaddingLengthGenerator)
 		if !ok {
-			return nil, newError("invalid option: RequestOptionGlobalPadding")
+			return nil, errors.New("invalid option: RequestOptionGlobalPadding")
 		}
 	}
 
 	switch request.Security {
-	case protocol.SecurityType_NONE:
-		if request.Option.Has(protocol.RequestOptionChunkStream) {
-			if request.Command.TransferType() == protocol.TransferTypeStream {
-				return crypto.NewChunkStreamReader(sizeParser, reader), nil
-			}
-
-			auth := &crypto.AEADAuthenticator{
-				AEAD:                    new(NoOpAuthenticator),
-				NonceGenerator:          crypto.GenerateEmptyBytes(),
-				AdditionalDataGenerator: crypto.GenerateEmptyBytes(),
-			}
-			return crypto.NewAuthenticationReader(auth, sizeParser, reader, protocol.TransferTypePacket, padding), nil
-		}
-		return buf.NewReader(reader), nil
-
 	case protocol.SecurityType_AES128_GCM:
 		aead := crypto.NewAesGcm(s.requestBodyKey[:])
 		auth := &crypto.AEADAuthenticator{
@@ -321,7 +305,7 @@ func (s *ServerSession) DecodeRequestBody(request *protocol.RequestHeader, reade
 		return crypto.NewAuthenticationReader(auth, sizeParser, reader, request.Command.TransferType(), padding), nil
 
 	default:
-		return nil, newError("invalid option: Security")
+		return nil, errors.New("invalid option: Security")
 	}
 }
 
@@ -349,8 +333,7 @@ func (s *ServerSession) EncodeResponseHeader(header *protocol.ResponseHeader, wr
 	aeadResponseHeaderLengthEncryptionKey := vmessaead.KDF16(s.responseBodyKey[:], vmessaead.KDFSaltConstAEADRespHeaderLenKey)
 	aeadResponseHeaderLengthEncryptionIV := vmessaead.KDF(s.responseBodyIV[:], vmessaead.KDFSaltConstAEADRespHeaderLenIV)[:12]
 
-	aeadResponseHeaderLengthEncryptionKeyAESBlock := common.Must2(aes.NewCipher(aeadResponseHeaderLengthEncryptionKey)).(cipher.Block)
-	aeadResponseHeaderLengthEncryptionAEAD := common.Must2(cipher.NewGCM(aeadResponseHeaderLengthEncryptionKeyAESBlock)).(cipher.AEAD)
+	aeadResponseHeaderLengthEncryptionAEAD := crypto.NewAesGcm(aeadResponseHeaderLengthEncryptionKey)
 
 	aeadResponseHeaderLengthEncryptionBuffer := bytes.NewBuffer(nil)
 
@@ -364,8 +347,7 @@ func (s *ServerSession) EncodeResponseHeader(header *protocol.ResponseHeader, wr
 	aeadResponseHeaderPayloadEncryptionKey := vmessaead.KDF16(s.responseBodyKey[:], vmessaead.KDFSaltConstAEADRespHeaderPayloadKey)
 	aeadResponseHeaderPayloadEncryptionIV := vmessaead.KDF(s.responseBodyIV[:], vmessaead.KDFSaltConstAEADRespHeaderPayloadIV)[:12]
 
-	aeadResponseHeaderPayloadEncryptionKeyAESBlock := common.Must2(aes.NewCipher(aeadResponseHeaderPayloadEncryptionKey)).(cipher.Block)
-	aeadResponseHeaderPayloadEncryptionAEAD := common.Must2(cipher.NewGCM(aeadResponseHeaderPayloadEncryptionKeyAESBlock)).(cipher.AEAD)
+	aeadResponseHeaderPayloadEncryptionAEAD := crypto.NewAesGcm(aeadResponseHeaderPayloadEncryptionKey)
 
 	aeadEncryptedHeaderPayload := aeadResponseHeaderPayloadEncryptionAEAD.Seal(nil, aeadResponseHeaderPayloadEncryptionIV, aeadEncryptedHeaderBuffer.Bytes(), nil)
 	common.Must2(io.Copy(writer, bytes.NewReader(aeadEncryptedHeaderPayload)))
@@ -382,26 +364,11 @@ func (s *ServerSession) EncodeResponseBody(request *protocol.RequestHeader, writ
 		var ok bool
 		padding, ok = sizeParser.(crypto.PaddingLengthGenerator)
 		if !ok {
-			return nil, newError("invalid option: RequestOptionGlobalPadding")
+			return nil, errors.New("invalid option: RequestOptionGlobalPadding")
 		}
 	}
 
 	switch request.Security {
-	case protocol.SecurityType_NONE:
-		if request.Option.Has(protocol.RequestOptionChunkStream) {
-			if request.Command.TransferType() == protocol.TransferTypeStream {
-				return crypto.NewChunkStreamWriter(sizeParser, writer), nil
-			}
-
-			auth := &crypto.AEADAuthenticator{
-				AEAD:                    new(NoOpAuthenticator),
-				NonceGenerator:          crypto.GenerateEmptyBytes(),
-				AdditionalDataGenerator: crypto.GenerateEmptyBytes(),
-			}
-			return crypto.NewAuthenticationWriter(auth, sizeParser, writer, protocol.TransferTypePacket, padding), nil
-		}
-		return buf.NewWriter(writer), nil
-
 	case protocol.SecurityType_AES128_GCM:
 		aead := crypto.NewAesGcm(s.responseBodyKey[:])
 		auth := &crypto.AEADAuthenticator{
@@ -445,6 +412,6 @@ func (s *ServerSession) EncodeResponseBody(request *protocol.RequestHeader, writ
 		return crypto.NewAuthenticationWriter(auth, sizeParser, writer, request.Command.TransferType(), padding), nil
 
 	default:
-		return nil, newError("invalid option: Security")
+		return nil, errors.New("invalid option: Security")
 	}
 }

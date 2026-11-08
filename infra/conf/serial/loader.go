@@ -42,6 +42,9 @@ func findOffset(b []byte, o int) *offset {
 
 // DecodeJSONConfig reads from reader and decode the config into *conf.Config
 // syntax error could be detected.
+//
+// Permissive: accepts JSON with Java/Python-style comments via json_reader.Reader.
+// Used for local files and stdin where the config is human-edited.
 func DecodeJSONConfig(reader io.Reader) (*conf.Config, error) {
 	jsonConfig := &conf.Config{}
 
@@ -61,11 +64,28 @@ func DecodeJSONConfig(reader io.Reader) (*conf.Config, error) {
 			pos = findOffset(jsonContent.Bytes(), int(tErr.Offset))
 		}
 		if pos != nil {
-			return nil, newError("failed to read config file at line ", pos.line, " char ", pos.char).Base(err)
+			return nil, errors.New("failed to read config file at line ", pos.line, " char ", pos.char).Base(err)
 		}
-		return nil, newError("failed to read config file").Base(err)
+		return nil, errors.New("failed to read config file").Base(err)
 	}
 
+	return jsonConfig, nil
+}
+
+// DecodeJSONConfigStrict reads standard RFC 8259 JSON without comment-stripping.
+// Used for remote sources (http/https/http+unix) where the payload is produced by
+// automated systems and cannot contain JSON5/JSONC extensions. Avoids the
+// byte-by-byte comment stripper and TeeReader, which are significant overhead on
+// large configs.
+func DecodeJSONConfigStrict(reader io.Reader) (*conf.Config, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, errors.New("failed to read config file").Base(err)
+	}
+	jsonConfig := &conf.Config{}
+	if err := json.Unmarshal(data, jsonConfig); err != nil {
+		return nil, errors.New("failed to parse remote JSON config").Base(err)
+	}
 	return jsonConfig, nil
 }
 
@@ -77,7 +97,7 @@ func LoadJSONConfig(reader io.Reader) (*core.Config, error) {
 
 	pbConfig, err := jsonConfig.Build()
 	if err != nil {
-		return nil, newError("failed to parse json config").Base(err)
+		return nil, errors.New("failed to parse json config").Base(err)
 	}
 
 	return pbConfig, nil
@@ -88,17 +108,17 @@ func LoadJSONConfig(reader io.Reader) (*core.Config, error) {
 func DecodeTOMLConfig(reader io.Reader) (*conf.Config, error) {
 	tomlFile, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, newError("failed to read config file").Base(err)
+		return nil, errors.New("failed to read config file").Base(err)
 	}
 
 	configMap := make(map[string]interface{})
 	if err := toml.Unmarshal(tomlFile, &configMap); err != nil {
-		return nil, newError("failed to convert toml to map").Base(err)
+		return nil, errors.New("failed to convert toml to map").Base(err)
 	}
 
 	jsonFile, err := json.Marshal(&configMap)
 	if err != nil {
-		return nil, newError("failed to convert map to json").Base(err)
+		return nil, errors.New("failed to convert map to json").Base(err)
 	}
 
 	return DecodeJSONConfig(bytes.NewReader(jsonFile))
@@ -112,7 +132,7 @@ func LoadTOMLConfig(reader io.Reader) (*core.Config, error) {
 
 	pbConfig, err := tomlConfig.Build()
 	if err != nil {
-		return nil, newError("failed to parse toml config").Base(err)
+		return nil, errors.New("failed to parse toml config").Base(err)
 	}
 
 	return pbConfig, nil
@@ -123,12 +143,12 @@ func LoadTOMLConfig(reader io.Reader) (*core.Config, error) {
 func DecodeYAMLConfig(reader io.Reader) (*conf.Config, error) {
 	yamlFile, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, newError("failed to read config file").Base(err)
+		return nil, errors.New("failed to read config file").Base(err)
 	}
 
 	jsonFile, err := yaml.YAMLToJSON(yamlFile)
 	if err != nil {
-		return nil, newError("failed to convert yaml to json").Base(err)
+		return nil, errors.New("failed to convert yaml to json").Base(err)
 	}
 
 	return DecodeJSONConfig(bytes.NewReader(jsonFile))
@@ -142,7 +162,7 @@ func LoadYAMLConfig(reader io.Reader) (*core.Config, error) {
 
 	pbConfig, err := yamlConfig.Build()
 	if err != nil {
-		return nil, newError("failed to parse yaml config").Base(err)
+		return nil, errors.New("failed to parse yaml config").Base(err)
 	}
 
 	return pbConfig, nil

@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	goerrors "errors"
 	"io"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 )
 
 type ClientManager struct {
-	Enabled bool // wheather mux is enabled from user config
+	Enabled bool // whether mux is enabled from user config
 	Picker  WorkerPicker
 }
 
@@ -37,7 +38,7 @@ func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) erro
 		}
 	}
 
-	return newError("unable to find an available mux client").AtWarning()
+	return errors.New("unable to find an available mux client")
 }
 
 type WorkerPicker interface {
@@ -57,7 +58,7 @@ func (p *IncrementalWorkerPicker) cleanupFunc() error {
 	defer p.access.Unlock()
 
 	if len(p.workers) == 0 {
-		return newError("no worker")
+		return errors.New("no worker")
 	}
 
 	p.cleanup()
@@ -148,13 +149,17 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	}
 
 	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
-		ctx := session.ContextWithOutbound(context.Background(), &session.Outbound{
+		outbounds := []*session.Outbound{{
 			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
-		})
+		}}
+		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
 		ctx, cancel := context.WithCancel(ctx)
 
-		if err := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); err != nil {
-			errors.New("failed to handler mux client connection").Base(err).WriteToLog()
+		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
+			errC := errors.Cause(errP)
+			if !(goerrors.Is(errC, io.EOF) || goerrors.Is(errC, io.ErrClosedPipe) || goerrors.Is(errC, context.Canceled)) {
+				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
+			}
 		}
 		common.Must(c.Close())
 		cancel()
@@ -172,6 +177,7 @@ type ClientWorker struct {
 	sessionManager *SessionManager
 	link           transport.Link
 	done           *done.Instance
+	timer          *time.Ticker
 	strategy       ClientStrategy
 }
 
@@ -182,10 +188,12 @@ var (
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
+	stream.Writer = &MutexWriter{Writer: stream.Writer}
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
 		done:           done.New(),
+		timer:          time.NewTicker(time.Second * 16),
 		strategy:       s,
 	}
 
@@ -208,20 +216,28 @@ func (m *ClientWorker) Closed() bool {
 	return m.done.Done()
 }
 
+func (m *ClientWorker) WaitClosed() <-chan struct{} {
+	return m.done.Wait()
+}
+
+func (m *ClientWorker) Close() error {
+	return m.done.Close()
+}
+
 func (m *ClientWorker) monitor() {
-	timer := time.NewTicker(time.Second * 16)
-	defer timer.Stop()
+	defer m.timer.Stop()
 
 	for {
+		checkSize := m.sessionManager.Size()
+		checkCount := m.sessionManager.Count()
 		select {
 		case <-m.done.Wait():
 			m.sessionManager.Close()
-			common.Close(m.link.Writer)
+			common.Interrupt(m.link.Writer)
 			common.Interrupt(m.link.Reader)
 			return
-		case <-timer.C:
-			size := m.sessionManager.Size()
-			if size == 0 && m.sessionManager.CloseIfNoSession() {
+		case <-m.timer.C:
+			if m.sessionManager.CloseIfNoSessionAndIdle(checkSize, checkCount) {
 				common.Must(m.done.Close())
 			}
 		}
@@ -242,25 +258,30 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 }
 
 func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
-	dest := session.OutboundFromContext(ctx).Target
+	outbounds := session.OutboundsFromContext(ctx)
+	ob := outbounds[len(outbounds)-1]
 	transferType := protocol.TransferTypeStream
-	if dest.Network == net.Network_UDP {
+	if ob.Target.Network == net.Network_UDP {
 		transferType = protocol.TransferTypePacket
 	}
 	s.transferType = transferType
-	writer := NewWriter(s.ID, dest, output, transferType, xudp.GetGlobalID(ctx))
+	var inbound *session.Inbound
+	if session.IsReverseMuxFromContext(ctx) {
+		inbound = session.InboundFromContext(ctx)
+	}
+	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
 	defer s.Close(false)
 	defer writer.Close()
 
-	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
+	errors.LogInfo(ctx, "dispatching request to ", ob.Target)
 	if err := writeFirstPayload(s.input, writer); err != nil {
-		newError("failed to write first payload").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogInfoInner(ctx, err, "failed to write first payload")
 		writer.hasError = true
 		return
 	}
 
 	if err := buf.Copy(s.input, writer); err != nil {
-		newError("failed to fetch all input").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		errors.LogInfoInner(ctx, err, "failed to fetch all input")
 		writer.hasError = true
 		return
 	}
@@ -274,6 +295,8 @@ func (m *ClientWorker) IsClosing() bool {
 	return false
 }
 
+// IsFull returns true if this ClientWorker is unable to accept more connections.
+// it might be because it is closing, or the number of connections has reached the limit.
 func (m *ClientWorker) IsFull() bool {
 	if m.IsClosing() || m.Closed() {
 		return true
@@ -287,18 +310,22 @@ func (m *ClientWorker) IsFull() bool {
 }
 
 func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
-	if m.IsFull() || m.Closed() {
+	if m.IsFull() {
 		return false
 	}
 
 	sm := m.sessionManager
-	s := sm.Allocate()
+	s := sm.Allocate(&m.strategy, link.Reader, link.Writer)
 	if s == nil {
 		return false
 	}
-	s.input = link.Reader
-	s.output = link.Writer
 	go fetchInput(ctx, s, m.link.Writer)
+	if _, ok := link.Reader.(*pipe.Reader); !ok {
+		select {
+		case <-ctx.Done():
+		case <-s.done.Wait():
+		}
+	}
 	return true
 }
 
@@ -333,7 +360,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
 	if err != nil && buf.IsWriteError(err) {
-		newError("failed to write to downstream. closing session ", s.ID).Base(err).WriteToLog()
+		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
 		return buf.Copy(rr, buf.Discard)
 	}
@@ -360,10 +387,10 @@ func (m *ClientWorker) fetchOutput() {
 
 	var meta FrameMetadata
 	for {
-		err := meta.Unmarshal(reader)
+		err := meta.Unmarshal(reader, false)
 		if err != nil {
 			if errors.Cause(err) != io.EOF {
-				newError("failed to read metadata").Base(err).WriteToLog()
+				errors.LogInfoInner(context.Background(), err, "failed to read metadata")
 			}
 			break
 		}
@@ -379,12 +406,12 @@ func (m *ClientWorker) fetchOutput() {
 			err = m.handleStatusKeep(&meta, reader)
 		default:
 			status := meta.SessionStatus
-			newError("unknown status: ", status).AtError().WriteToLog()
+			errors.LogError(context.Background(), "unknown status: ", status)
 			return
 		}
 
 		if err != nil {
-			newError("failed to process data").Base(err).WriteToLog()
+			errors.LogInfoInner(context.Background(), err, "failed to process data")
 			return
 		}
 	}
